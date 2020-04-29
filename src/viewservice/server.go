@@ -10,14 +10,19 @@ import "os"
 import "sync/atomic"
 
 type ViewServer struct {
-	mu       sync.Mutex
-	l        net.Listener
-	dead     int32 // for testing
-	rpccount int32 // for testing
-	me       string
+	mu       		sync.Mutex
+	l        		net.Listener
+	dead     		int32 // for testing
+	rpccount 		int32 // for testing
+	me       		string
 
 
 	// Your declarations here.
+	currentView View
+	pingTime		map[string]time.Time
+	idleServer	string
+	primaryACK	bool
+	backupACK		bool
 }
 
 //
@@ -26,7 +31,43 @@ type ViewServer struct {
 func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 
 	// Your code here.
+	vs.mu.Lock()
 
+	// update time
+	currentServer := args.Me
+	vs.pingTime[currentServer] = time.Now()
+
+	// check primary server
+	if currentServer == vs.currentView.Primary{
+		// check if it ACKs currentView
+		if args.Viewnum == vs.currentView.Viewnum{
+			vs.primaryACK = true
+		} else if args.Viewnum == 0 && vs.primaryACK == true{
+			// primary crash -> backup takes over
+			update(vs, vs.currentView.Backup, vs.idleServer)
+		}
+	} else if currentServer == vs.currentView.Backup{
+		// check if it ACKs currentView
+		if args.Viewnum == vs.currentView.Viewnum{
+			vs.backupACK = true
+		} else if args.Viewnum == 0 && vs.backupACK == true{
+			// backup crash -> use idle server as backup
+			update(vs, vs.currentView.Primary, vs.idleServer)
+		}
+	} else{
+		// other pings
+		if vs.currentView.Viewnum != 0{
+			// new idle server
+			vs.idleServer = currentServer
+		} else{
+			// make primary
+			update(vs, currentServer, "")
+		}
+	}
+
+	reply.View = vs.currentView
+	log.Printf("Viewserver reply: %v\n", reply.View)
+	vs.mu.Unlock()
 	return nil
 }
 
@@ -36,7 +77,9 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 
 	// Your code here.
-
+	vs.mu.Lock()
+	reply.View = vs.currentView
+	vs.mu.Unlock()
 	return nil
 }
 
@@ -46,9 +89,53 @@ func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 // if servers have died or recovered, and change the view
 // accordingly.
 //
-func (vs *ViewServer) tick() {
-
+func (vs *ViewServer) tick(){
+	log.Printf("Entering tick")
 	// Your code here.
+	vs.mu.Lock()
+	now := time.Now()
+	timeWindow := DeadPings * PingInterval
+
+	// check if we can get the primary server
+	if now.Sub(vs.pingTime[vs.currentView.Primary]) >= timeWindow && vs.primaryACK == true{
+		// primary already ACK currentView -> update view using backup
+		log.Printf("Viewserver tick: received primary")
+		update(vs, vs.currentView.Backup, vs.idleServer)
+	}
+
+	// check recent pings from backup server
+	if now.Sub(vs.pingTime[vs.currentView.Backup]) >= timeWindow  && vs.backupACK == true{
+		// check if it has an idle server
+		log.Printf("Viewserver tick: received backup")
+		// check if there's an idle server
+		if vs.idleServer != ""{
+			// use idle server as backup
+			update(vs, vs.currentView.Primary, vs.idleServer)
+		}
+	}
+
+	// check pings from idle server
+	if now.Sub(vs.pingTime[vs.idleServer]) >= timeWindow{
+		log.Printf("Viewserver tick: idle server")
+		vs.idleServer = ""
+	} else {
+		if vs.primaryACK == true && vs.idleServer != "" && vs.currentView.Backup == ""{
+			// no backup -> use idle server
+			update(vs, vs.currentView.Primary, vs.idleServer)
+		}
+	}
+
+	vs.mu.Unlock()
+}
+
+// function that updates the view according to the given primary/ backup servers
+func update(vs *ViewServer, primary string, backup string){
+	vs.currentView.Viewnum += 1
+	vs.currentView.Primary = primary
+	vs.currentView.Backup = backup
+	vs.idleServer = ""
+	vs.primaryACK = false
+	vs.backupACK = false
 }
 
 //
@@ -77,6 +164,14 @@ func StartServer(me string) *ViewServer {
 	vs := new(ViewServer)
 	vs.me = me
 	// Your vs.* initializations here.
+	vs.currentView = View{}
+	vs.currentView.Viewnum = 0
+	vs.currentView.Primary = ""
+	vs.currentView.Backup = ""
+	vs.idleServer = ""
+	vs.pingTime = make(map[string]time.Time)
+	vs.primaryACK = false
+	vs.backupACK = false
 
 	// tell net/rpc about our RPC server and handlers.
 	rpcs := rpc.NewServer()
