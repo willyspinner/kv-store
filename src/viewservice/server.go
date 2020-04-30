@@ -10,19 +10,19 @@ import "os"
 import "sync/atomic"
 
 type ViewServer struct {
-	mu       		sync.Mutex
-	l        		net.Listener
-	dead     		int32 // for testing
-	rpccount 		int32 // for testing
-	me       		string
+	mu       			sync.Mutex
+	l        			net.Listener
+	dead     			int32 // for testing
+	rpccount 			int32 // for testing
+	me       			string
 
 
 	// Your declarations here.
-	currentView View
-	pingTime		map[string]time.Time
-	idleServer	string
-	primaryACK	bool
-	backupACK		bool
+	currentView 	View
+	pingTime			map[string]time.Time
+	idleServer		string
+	primaryACK		bool
+	backupACK			bool
 }
 
 //
@@ -66,7 +66,6 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 	}
 
 	reply.View = vs.currentView
-	log.Printf("Viewserver reply: %v\n", reply.View)
 	vs.mu.Unlock()
 	return nil
 }
@@ -90,7 +89,6 @@ func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 // accordingly.
 //
 func (vs *ViewServer) tick(){
-	log.Printf("Entering tick")
 	// Your code here.
 	vs.mu.Lock()
 	now := time.Now()
@@ -99,14 +97,11 @@ func (vs *ViewServer) tick(){
 	// check if we can get the primary server
 	if now.Sub(vs.pingTime[vs.currentView.Primary]) >= timeWindow && vs.primaryACK == true{
 		// primary already ACK currentView -> update view using backup
-		log.Printf("Viewserver tick: received primary")
 		update(vs, vs.currentView.Backup, vs.idleServer)
 	}
 
 	// check recent pings from backup server
 	if now.Sub(vs.pingTime[vs.currentView.Backup]) >= timeWindow  && vs.backupACK == true{
-		// check if it has an idle server
-		log.Printf("Viewserver tick: received backup")
 		// check if there's an idle server
 		if vs.idleServer != ""{
 			// use idle server as backup
@@ -116,7 +111,6 @@ func (vs *ViewServer) tick(){
 
 	// check pings from idle server
 	if now.Sub(vs.pingTime[vs.idleServer]) >= timeWindow{
-		log.Printf("Viewserver tick: idle server")
 		vs.idleServer = ""
 	} else {
 		if vs.primaryACK == true && vs.idleServer != "" && vs.currentView.Backup == ""{
