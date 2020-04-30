@@ -217,6 +217,12 @@ func StartServer(vshost string, me string) *PBServer {
 	pb.me = me
 	pb.vs = viewservice.MakeClerk(me, vshost)
 	// Your pb.* initializations here.
+	pb.currentView.Viewnum = 0
+	pb.currentView.Primary = ""
+	pb.currentView.Backup = ""
+	pb.inSync = false
+	pb.keyVal = make(map[string]string)
+	pb.clientReq = make(map[int64]Request)
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(pb)
