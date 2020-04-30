@@ -103,10 +103,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
     ID := nrand()
     putAppendArgs := PutAppendArgs{Key:key, ID: ID, Value: value, Command: op}
 	var putAppendReply PutAppendReply
-	fmt.Printf("clerk client: Call PutAppend() with key %s, value %s, op %s\n", key,value,op)
     for {
         ok := call(ck.primaryServ, "PBServer.PutAppend", putAppendArgs, &putAppendReply)
-		fmt.Printf("clerk client: Call PutAppend() RPC return : %v\n", ok)
         if ok && putAppendReply.Err == OK {
             break
         } else {
