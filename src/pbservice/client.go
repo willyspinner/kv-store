@@ -3,6 +3,7 @@ package pbservice
 import "viewservice"
 import "net/rpc"
 import "fmt"
+import "time"
 
 import "crypto/rand"
 import "math/big"
@@ -11,6 +12,7 @@ import "math/big"
 type Clerk struct {
 	vs *viewservice.Clerk
 	// Your declarations here
+    primaryServ string
 }
 
 // this may come in handy.
@@ -25,9 +27,10 @@ func MakeClerk(vshost string, me string) *Clerk {
 	ck := new(Clerk)
 	ck.vs = viewservice.MakeClerk(me, vshost)
 	// Your ck.* initializations here
-
+    ck.primaryServ = ck.vs.Primary()
 	return ck
 }
+
 
 
 //
@@ -74,16 +77,42 @@ func call(srv string, rpcname string,
 func (ck *Clerk) Get(key string) string {
 
 	// Your code here.
+    ID := nrand()
+    getArgs := GetArgs{Key:key, ID: ID}
+    var getReply GetReply
 
-	return "???"
+    for {
+        ok := call(ck.primaryServ, "PBServer.Get", getArgs, &getReply)
+        if ok {
+            break
+        } else {
+            // Figure out primary using VS.
+            ck.primaryServ = ck.vs.Primary()
+            time.Sleep(viewservice.PingInterval)
+        }
+    }
+
+	return getReply.Value
 }
 
 //
 // send a Put or Append RPC
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-
 	// Your code here.
+    ID := nrand()
+    putAppendArgs := PutAppendArgs{Key:key, ID: ID, Value: value, Command: op}
+	var putAppendReply PutAppendReply
+    for {
+        ok := call(ck.primaryServ, "PBServer.PutAppend", putAppendArgs, &putAppendReply)
+        if ok && putAppendReply.Err == OK {
+            break
+        } else {
+            // Figure out primary using VS.
+            ck.primaryServ = ck.vs.Primary()
+            time.Sleep(viewservice.PingInterval)
+        }
+    }
 }
 
 //

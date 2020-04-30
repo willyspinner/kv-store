@@ -11,6 +11,7 @@ import "sync/atomic"
 import "os"
 import "syscall"
 import "math/rand"
+import "path"
 
 
 
@@ -24,26 +25,43 @@ type PBServer struct {
 	// Your declarations here.
 	currentView	viewservice.View
 	keyVal		map[string]string
-	inSync		bool			// tracks if primary and backup are in sync
 	clientReq	map[int64]Request	// client requests: job ID & request type
 }
+
+
+/* helper log unction */
+func (pb *PBServer) logPrintf(format string, args ...interface{}) {
+    /* prints the basename of pb.me and the other stuff. */
+    serviceName := path.Base(pb.me)
+    isDebug := os.Getenv("LOGLEVEL") == "DEBUG"
+    if isDebug {
+        fmt.Printf("%s: %s", serviceName, fmt.Sprintf(format, args...))
+    }
+
+}
+
 
 func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 
 	// Your code here.
 	pb.mu.Lock()
-
-	// Duplicate RPC request
-	req, ok := pb.clientReq[args.ID]
-	if req.Key == args.Key && ok == true{
-		reply.Err = OK
-		reply.Value = pb.keyVal[args.Key]
-		return nil
-	}
+    defer pb.mu.Unlock()
 
 	// if not primary -> send back
 	if pb.me != pb.currentView.Primary{
 		reply.Err = ErrWrongServer
+        pb.logPrintf("GET req: %v, BUT wrong server \n", args)
+		return nil
+	}
+    pb.logPrintf("GET req: %v, VAL: %s \n", args, pb.keyVal[args.Key] )
+
+	// Duplicate RPC request
+	// return old value (stale) for that request
+	req, exists  := pb.clientReq[args.ID]
+	if exists && req.Key == args.Key {
+		reply.Err = OK
+        //TODO: should we return stale value or new value?
+		reply.Value = pb.keyVal[args.Key]
 		return nil
 	}
 
@@ -56,35 +74,26 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 		reply.Value = val
 	}
 
-	// update clientReq
-	new_req := pb.clientReq[args.ID]
-	new_req.Key = args.Key
-	new_req.Value = ""
-	new_req.Command = "Get"
+    // form the request obj and update clientReq
+    pb.clientReq[args.ID] = Request{Key:args.Key, Value: "", Command: "Get"}
 
-	// forward to backup
-	if pb.currentView.Backup != ""{
-		// send RPC request
-		send := call(pb.currentView.Backup, "PBServer.BackupGet", args, &reply)
-		if send == false || reply.Err == ErrWrongServer || reply.Value != pb.keyVal[args.Key]{
-			pb.inSync = true
-		}
-	}
-
-	pb.mu.Unlock()
+    // No need to forward a 'Get' to backup. We are done here
 	return nil
 
 }
+
 
 
 func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 
 	// Your code here.
 	pb.mu.Lock()
+    defer pb.mu.Unlock()
 
-	// Duplicate request
-	req, ok := pb.clientReq[args.ID]
-	if req.Key == args.Key && req.Command == args.Command && ok == true{
+	// Check for Duplicate request
+	req, exists := pb.clientReq[args.ID]
+	pb.logPrintf("got PutAppend req: %v\n", args)
+	if exists && req.Key == args.Key && req.Command == args.Command && req.Value == args.Value {
 		reply.Err = OK
 		return nil
 	}
@@ -95,32 +104,118 @@ func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error 
 		return nil
 	}
 
-	// process put and append commands
-	if args.Command == "Put"{
-		pb.keyVal[args.Key] = args.Value
-	} else if args.Command == "Append"{
-		pb.keyVal[args.Key] = args.Value + pb.keyVal[args.Key]
-	}
 
-	// update clientReq
-	new_req := pb.clientReq[args.ID]
-	new_req.Key = args.Key
-	new_req.Value = args.Value
-	new_req.Command = args.Command
 	reply.Err = OK
 
-	// forward to backup
-	if pb.currentView.Backup != ""{
+	// forward to backup, if there is one
+	if pb.currentView.Backup != "" {
 		// send RPC request
-		send := call(pb.currentView.Backup, "PBServer.BackupGet", args, &reply)
-		if send == false || reply.Err != OK || args.Value != pb.keyVal[args.Key]{
-			pb.inSync = true
-		}
+        var backupReply PutAppendReply
+        needBackup := false
+        for {
+            send := false
+            if !needBackup {
+                send = call(pb.currentView.Backup, "PBServer.ForwardPutAppend", args, &backupReply)
+            }
+            if send == true {
+                break
+            } else {
+                // When call fails, we need to retry until it succeeds. Otherwise, consider scenario:
+                // 1. X gets PUTted to primary. Primary stores 
+                // 2. primary forwards to backup but fails. Primary will sync to backup next tick
+                // 3. primary goes down before next tick
+                // 4. backup becomes primary. Doesn't have new X.
+
+                curr, _ := pb.vs.Ping(pb.currentView.Viewnum)
+                if curr.Primary != pb.me {
+                    reply.Err = ErrWrongServer
+                    pb.currentView = curr
+                    return nil
+                }
+                if curr.Backup == pb.currentView.Backup {
+                    // we don't need to sync backup. We just need to forward this put again.
+                    needBackup = false
+                } else {
+                    if curr.Backup == "" {
+                        // current backup is down. We don't need to backup. 
+                        pb.currentView = curr
+                        needBackup = false
+                        break
+                    } else {
+                        // deal with new backup. Need to sync HERE
+                        backupSuccess := pb.syncToBackup(curr.Backup)
+                        needBackup = backupSuccess == false
+                    }
+                }
+                time.Sleep(viewservice.PingInterval)
+                pb.currentView = curr
+            }
+        }
+        if backupReply.Err == ErrWrongServer {
+            reply.Err = ErrWrongServer  // this server not primary anymore
+            // at this point, we don't actually write it.
+            return nil
+        } else {
+            reply.Err = OK
+        }
+	} else {
+		pb.logPrintf("no backup in currentView. Skipping forwarding.... \n")
 	}
-	pb.mu.Unlock()
+
+	// After being sure that backup has our write, then we store it locally.
+	if args.Command == "Put" {
+		pb.keyVal[args.Key] = args.Value
+	} else if args.Command == "Append" {
+        _, exists := pb.keyVal[args.Key]
+        if ! exists {
+            pb.keyVal[args.Key] = ""
+        }
+		pb.keyVal[args.Key] += args.Value
+	}
+	// Lastly, we update clientReq , as we've finally 'committed' the request (backups have it)
+    pb.clientReq[args.ID] = Request{Key: args.Key, Value: args.Value, Command: args.Command}
+
+
 	return nil
 }
 
+
+
+/* RPC function to forward PUT/APPEND requests to backup server */
+func (pb *PBServer) ForwardPutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	if pb.me == pb.currentView.Primary{
+        pb.logPrintf("IS A PRIMARY BUT got forwarded PutAppend req: %v\n", args)
+        // I'm a primary! Don't forward the requests to me! 
+		reply.Err = ErrWrongServer
+		return nil
+	}
+
+    // First, need to check if request already done. This is to make sure that when this backup's ack to primary 
+    // gets lost, when primary reacks again, this backup doesn't do anything.
+	req, exists := pb.clientReq[args.ID]
+	if exists && req.Key == args.Key && req.Command == args.Command && args.Value == req.Value {
+		reply.Err = OK
+        pb.logPrintf("Backup: got forwarded PutAppend req: %v, but request alr exists \n", args)
+		return nil
+	}
+
+	if args.Command == "Put" {
+		pb.keyVal[args.Key] = args.Value
+	} else if args.Command == "Append"{
+        _, exists := pb.keyVal[args.Key]
+        if ! exists {
+            pb.keyVal[args.Key] = ""
+        }
+		pb.keyVal[args.Key] += args.Value
+	}
+
+	// update clientReq
+    pb.clientReq[args.ID] = Request{Key: args.Key, Value: args.Value, Command: args.Command}
+	reply.Err = OK
+    return nil
+}
 
 //
 // ping the viewserver periodically.
@@ -132,14 +227,18 @@ func (pb *PBServer) TransferToBackup(args *TransferToBackupArgs, reply *Transfer
 	// ping viewservice
 	curr, ok := pb.vs.Ping(pb.currentView.Viewnum)
 	if ok != nil{
-		log.Printf("Ping failed: %v", curr)
+		pb.logPrintf("Ping failed in TransferToBackup(): %v", curr)
 	}
 
+    pb.mu.Lock()
+    defer pb.mu.Unlock()
 	// if not backup send back
-	if pb.me != curr.Backup{
+	if pb.me != curr.Backup {
 		reply.Err = ErrWrongServer
+        pb.logPrintf("got TransfertoBackup request, but i'm a primary! \n")
 		return nil
 	}
+    pb.logPrintf("Backup: got TransfertoBackup request: %v \n", args)
 
 	// update keyVal for backup
 	pb.keyVal = args.Kv
@@ -148,41 +247,44 @@ func (pb *PBServer) TransferToBackup(args *TransferToBackupArgs, reply *Transfer
 	return nil
 }
 
-func (pb *PBServer) tick() {
+func (pb *PBServer) syncToBackup(backupSrv string) bool {
+    args := &TransferToBackupArgs{Kv: pb.keyVal, Requests: pb.clientReq}
+    var reply TransferToBackupReply
+    ok := call(backupSrv, "PBServer.TransferToBackup", args, &reply)
+    return ok && reply.Err == OK
+}
 
+
+func (pb *PBServer) tick() {
 	// Your code here.
 	pb.mu.Lock()
-
+	defer pb.mu.Unlock()
 	// ping viewserver
-	curr, ok := pb.vs.Ping(pb.currentView.Viewnum)
-
-	if ok == nil{
-		if pb.inSync == true{
-			// sync primary and backup
-			args := &TransferToBackupArgs{Kv: pb.keyVal, Requests: pb.clientReq}
-
-			// send RPC request
-			var reply TransferToBackupReply
-			req := call(curr.Backup, "PBServer.TransferToBackup", args, &reply)
-
-			if reply.Err != OK || req == false{
-				pb.inSync = true
-			}
-			// set inSync to false after successful transfer
-			pb.inSync = false
-		}
-		if pb.me == curr.Primary && pb.currentView.Backup != curr.Backup{
-			if curr.Backup != ""{
-				pb.inSync = true
+	curr, pingErr := pb.vs.Ping(pb.currentView.Viewnum)
+	if pingErr == nil {
+		//TODO: verify that this is correct
+		if pb.me == curr.Primary {
+			if (pb.currentView.Backup != curr.Backup) && curr.Backup != "" {
+                // since primary and backup not in sync, we // have to transfer entire KV to backup.
+                //TODO:  need to do this multiple times.
+                /*
+                e.g. 
+                new backup goes online
+                primary tries to sync, but fails
+                then before next tick() call primary goes down.
+                die?
+                */
+                syncOK := pb.syncToBackup(curr.Backup)
+                if !syncOK {
+                    pb.logPrintf("FAILed to syncToBackup during tick() \n")
+                }
 			}
 		}
-	} else{
-		log.Printf("Ping failed: %v", curr)
+	} else {
+		pb.logPrintf("Ping failed in tick() method: %v", curr)
 	}
-
 	// update view
 	pb.currentView = curr
-	pb.mu.Unlock()
 
 }
 
@@ -220,9 +322,9 @@ func StartServer(vshost string, me string) *PBServer {
 	pb.currentView.Viewnum = 0
 	pb.currentView.Primary = ""
 	pb.currentView.Backup = ""
-	pb.inSync = false
 	pb.keyVal = make(map[string]string)
 	pb.clientReq = make(map[int64]Request)
+	pb.mu = sync.Mutex{}
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(pb)
