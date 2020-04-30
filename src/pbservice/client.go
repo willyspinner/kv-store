@@ -83,7 +83,7 @@ func (ck *Clerk) Get(key string) string {
 
     for {
         ok := call(ck.primaryServ, "PBServer.Get", getArgs, &getReply)
-        if ok {
+        if ok && getReply.Err == OK {
             break
         } else {
             // Figure out primary using VS.

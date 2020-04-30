@@ -60,7 +60,6 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 	req, exists  := pb.clientReq[args.ID]
 	if exists && req.Key == args.Key {
 		reply.Err = OK
-        //TODO: should we return stale value or new value?
 		reply.Value = pb.keyVal[args.Key]
 		return nil
 	}
@@ -153,7 +152,6 @@ func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error 
         }
         if backupReply.Err == ErrWrongServer {
             reply.Err = ErrWrongServer  // this server not primary anymore
-            // at this point, we don't actually write it.
             return nil
         } else {
             reply.Err = OK
@@ -227,7 +225,7 @@ func (pb *PBServer) TransferToBackup(args *TransferToBackupArgs, reply *Transfer
 	// ping viewservice
 	curr, ok := pb.vs.Ping(pb.currentView.Viewnum)
 	if ok != nil{
-		pb.logPrintf("Ping failed in TransferToBackup(): %v", curr)
+		pb.logPrintf("Ping failed in TransferToBackup(): %v\n", curr)
 	}
 
     pb.mu.Lock()
@@ -260,29 +258,32 @@ func (pb *PBServer) tick() {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 	// ping viewserver
-	curr, pingErr := pb.vs.Ping(pb.currentView.Viewnum)
-	if pingErr == nil {
-		//TODO: verify that this is correct
-		if pb.me == curr.Primary {
-			if (pb.currentView.Backup != curr.Backup) && curr.Backup != "" {
-                // since primary and backup not in sync, we // have to transfer entire KV to backup.
-                //TODO:  need to do this multiple times.
-                /*
-                e.g. 
-                new backup goes online
-                primary tries to sync, but fails
-                then before next tick() call primary goes down.
-                die?
-                */
-                syncOK := pb.syncToBackup(curr.Backup)
-                if !syncOK {
-                    pb.logPrintf("FAILed to syncToBackup during tick() \n")
+    var curr viewservice.View
+    var pingErr error
+    for {
+        curr, pingErr = pb.vs.Ping(pb.currentView.Viewnum)
+        if pingErr == nil {
+            if pb.me == curr.Primary {
+                if (pb.currentView.Backup != curr.Backup) && curr.Backup != "" {
+                    // since new backup is detected, we have to transfer entire KV to backup.
+                    syncOK := pb.syncToBackup(curr.Backup)
+                    if syncOK {
+                        break
+                    } else {
+                        pb.logPrintf("FAILed to syncToBackup during tick(). Retrying.. \n")
+                    }
+                } else {
+                    break
                 }
-			}
-		}
-	} else {
-		pb.logPrintf("Ping failed in tick() method: %v", curr)
-	}
+            } else {
+                break
+            }
+        } else {
+            pb.logPrintf("Ping failed in tick() method: %v\n", curr)
+        }
+        time.Sleep(viewservice.PingInterval)
+    }
+
 	// update view
 	pb.currentView = curr
 
