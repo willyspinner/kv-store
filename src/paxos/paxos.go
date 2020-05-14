@@ -30,19 +30,11 @@ import "sync"
 import "sync/atomic"
 import "fmt"
 import "math/rand"
-import "math"
 import "time"
 
 import "hash/fnv"
 
 
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-    isDebug := os.Getenv("LOGLEVEL") == "DEBUG"
-	if isDebug {
-		log.Printf(format, a...)
-	}
-	return
-}
 
 // px.Status() return values, indicating
 // whether an agreement has been decided,
@@ -71,17 +63,6 @@ const (
 )
 
 
-type ProposalNum int64
-
-// struct to keep information about a slot in the log
-type lSlot struct {
-    v           interface{} // actual value (if decided)
-    v_a         interface{} // accepted value of slot
-    n_a         ProposalNum // accepted number
-    n_p         ProposalNum // highest proposed number
-    fate        Fate
-    meCommitted int // ID of proposer to whom acceptor has committed
-}
 
 
 type Paxos struct {
@@ -100,6 +81,8 @@ type Paxos struct {
     peersDone  map[int] int // maps a peers entry to its done level 
     meHash     uint32
     meDone     int // our latest Done() value.
+
+    nMajority  int // how many votes needed for a majority. This stays constant
 }
 
 //
@@ -139,47 +122,6 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 }
 
 
-type Ph1AcceptArgs struct {
-    Seq    int
-    N      ProposalNum
-    Me     int
-    MeDone int // piggybacking proposer's Done Value
-}
-
-type Ph1AcceptReply struct {
-    OK              bool // true if it has received a promise
-    N               ProposalNum
-    AlreadyAccepted bool
-    V_a             interface{}
-    N_a             ProposalNum
-    MeCommitted     int // Id of proposer to whom acceptor has committed. This is to aid liveness back off
-    N_p             ProposalNum // if proposal fails, proposer uses this to change its propnum.
-}
-
-
-type Ph2AcceptArgs struct {
-    Seq         int
-    N           ProposalNum
-    V           interface{}
-    Me          int
-    MeDone      int // piggybacking Done value 
-}
-
-type Ph2AcceptReply struct {
-    OK          bool
-    N_p         ProposalNum // if proposal fails, proposer uses this to change propnum
-}
-
-type Ph3DecidedArgs struct {
-    Seq         int
-    Me          int
-    V           interface{}
-    MeDone      int // piggybacking done value
-}
-
-type Ph3DecidedReply struct {
-    OK          bool
-}
 
 // ------------ acceptor functions ------------------
 
@@ -262,7 +204,6 @@ func (px *Paxos) Ph3DecidedRPCHandler (args *Ph3DecidedArgs, reply *Ph3DecidedRe
         defer px.mu.Unlock()
     }
     _, exists := px.log[args.Seq]
-    
     if ! exists{
         DPrintf("px me %d: PH# px.log[%d] DOES NOT EXIST. currentMinSeq: %d, maxseq: %d\n",px.me, args.Seq, px.currentMinSeq, px.currentMaxSeq)
         px.log[args.Seq] = &lSlot{
@@ -287,7 +228,6 @@ func (px *Paxos) Ph3DecidedRPCHandler (args *Ph3DecidedArgs, reply *Ph3DecidedRe
 // utility function to get the majority from PH1 (prepare propose) replies
 // returns (true, value) if there is a majority, otherwise false.
 func (px *Paxos) getMajority(replies []Ph1AcceptReply, hasReplied []bool) (bool, interface{}) {
-    nMajority := int(math.Ceil(float64(len(px.peers) / 2)))
     naCounts := make(map[ProposalNum]int)
     for _, reply := range replies {
         if reply.AlreadyAccepted {
@@ -303,7 +243,7 @@ func (px *Paxos) getMajority(replies []Ph1AcceptReply, hasReplied []bool) (bool,
             highestN_a = N_a
         }
     }
-    if highestCount < nMajority {
+    if highestCount < px.nMajority {
         return false, nil
     }
 
@@ -330,6 +270,9 @@ func (px *Paxos) runLearner () {
         // (potential improvement)
         px.mu.Lock()
         for seq := px.currentMinSeq; seq <= px.currentMaxSeq; seq++ {
+            DPrintf("px me %d: runLearner() is scanning from px.currentMinSeq %d to px.currentMaxSeq %d (inclusive) \n",
+            px.me, px.currentMinSeq, px.currentMaxSeq)
+
             slot, exists := px.log[seq]
             if exists && slot.fate == Pending {
                 // then ping acceptors for this seq instance
@@ -452,7 +395,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
     go func() {
         var currentN uint32 = 1
         var propNum ProposalNum = px.getProposalNumber(currentN)
-        nMajority := int(math.Ceil(float64(len(px.peers)) / 2))
+            
         for {
             px.mu.Lock()
             if px.currentMinSeq > seq || px.log[seq].fate == Decided {
@@ -497,8 +440,8 @@ func (px *Paxos) Start(seq int, v interface{}) {
                 }
             }
             DPrintf("px me %d: proposer thread for seq %d: after phase 1 rpc calls. Obtained %d nPromises, %d maj needed, total: %d\n",
-            px.me, seq, nPromises,nMajority, len(px.peers))
-            if nPromises < nMajority {
+            px.me, seq, nPromises,px.nMajority, len(px.peers))
+            if nPromises < px.nMajority {
                 DPrintf("px me %d: proposer thread for seq %d: restarting since more votes needed.\n",px.me, seq)
                 nProp, _ := px.parseProposalNumber(maxNp)
                 currentN = nProp + 1
@@ -566,7 +509,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
                 }
             }
 
-            if nOKs >= nMajority  {
+            if nOKs >= px.nMajority  {
                 // ----------------------- PHASE 3 - send DECIDED RPC ------------------------------
                 DPrintf("px me %d: proposer thread for seq %d: entering phase 3..\n",px.me, seq)
 
@@ -718,7 +661,6 @@ func (px *Paxos) Status(seq int) (Fate, interface{}) {
 	// Your code here.
     px.mu.Lock()
     defer px.mu.Unlock()
-    DPrintf("px me %d: status for seq %d, log: %v\n",px.me, seq, px.log)
     if seq < px.currentMinSeq {
         return Forgotten, nil
     }
@@ -728,6 +670,7 @@ func (px *Paxos) Status(seq int) (Fate, interface{}) {
         // (Piazza @219_f2)
         return Pending, nil
     }
+    DPrintf("px me %d: status for seq %d, Decided: %v, log: %v\n",px.me, seq, logSlot.fate == Decided,px.log)
     return logSlot.fate, logSlot.v
 }
 
@@ -782,6 +725,7 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
     h := fnv.New32a()
     h.Write([]byte(peers[me]))
     px.meHash = h.Sum32()
+    px.nMajority = (len(px.peers) / 2) + 1 // account for both odd and even
 
 
 	// Your initialization code here.
