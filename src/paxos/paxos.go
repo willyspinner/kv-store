@@ -35,10 +35,10 @@ import "time"
 
 import "hash/fnv"
 
-const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
+    isDebug := os.Getenv("LOGLEVEL") == "DEBUG"
+	if isDebug {
 		log.Printf(format, a...)
 	}
 	return
@@ -97,9 +97,9 @@ type Paxos struct {
     log        map[int]*lSlot // maps sequence number to the corresponding lslot object
     currentMinSeq int // minimum sequence number that hasn't been forgotten
     currentMaxSeq int // max sequence number this paxos peer knows so far.
-    peersDone  map[string] int // maps a peers entry to its done level 
-    //TODO: I HAVENT DONE ANYTHING ABOUT DONE LEVEL. NEED TO DO THIS!
+    peersDone  map[int] int // maps a peers entry to its done level 
     meHash     uint32
+    meDone     int // our latest Done() value.
 }
 
 //
@@ -139,11 +139,11 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 }
 
 
-
 type Ph1AcceptArgs struct {
     Seq    int
     N      ProposalNum
     Me     int
+    MeDone int // piggybacking proposer's Done Value
 }
 
 type Ph1AcceptReply struct {
@@ -162,6 +162,7 @@ type Ph2AcceptArgs struct {
     N           ProposalNum
     V           interface{}
     Me          int
+    MeDone      int // piggybacking Done value 
 }
 
 type Ph2AcceptReply struct {
@@ -173,6 +174,7 @@ type Ph3DecidedArgs struct {
     Seq         int
     Me          int
     V           interface{}
+    MeDone      int // piggybacking done value
 }
 
 type Ph3DecidedReply struct {
@@ -182,9 +184,11 @@ type Ph3DecidedReply struct {
 // ------------ acceptor functions ------------------
 
 func (px *Paxos) Ph1AcceptRPCHandler (args *Ph1AcceptArgs, reply *Ph1AcceptReply) error {
-    DPrintf("px me %d: ph1 accept rpc handler for seq %d\n",px.me, args.Seq)
+    DPrintf("px me %d: ph1 accept rpc handler for seq %d. begin\n",px.me, args.Seq)
     if args.Me != px.me {
         px.mu.Lock()
+        px.peersDone[args.Me] = args.MeDone
+        px.cleanupDones()
         defer px.mu.Unlock()
     }
     slot, exists := px.log[args.Seq]
@@ -202,7 +206,7 @@ func (px *Paxos) Ph1AcceptRPCHandler (args *Ph1AcceptArgs, reply *Ph1AcceptReply
     if args.N > slot.n_p  || slot.n_p == N_NIL {
         // commit to proposal
         reply.OK = true
-        slot.n_p = args.N
+        px.log[args.Seq].n_p = args.N
         reply.N = args.N
         if slot.n_a == N_NIL {
             reply.AlreadyAccepted = false
@@ -223,13 +227,22 @@ func (px *Paxos) Ph1AcceptRPCHandler (args *Ph1AcceptArgs, reply *Ph1AcceptReply
 func (px *Paxos) Ph2AcceptRPCHandler (args *Ph2AcceptArgs, reply *Ph2AcceptReply) error {
     if args.Me != px.me {
         px.mu.Lock()
+        px.peersDone[args.Me] = args.MeDone
         defer px.mu.Unlock()
     }
-    slot, _ := px.log[args.Seq]
-    if args.N >= slot.n_p {
-        slot.n_p = args.N
-        slot.n_a = args.N
-        slot.v_a = args.V
+    slot, exists := px.log[args.Seq]
+    if ! exists{
+        px.log[args.Seq] = &lSlot{
+            n_a: N_NIL,
+            n_p: N_NIL,
+            fate: Pending,
+        }
+        slot = px.log[args.Seq]
+    }
+    if !exists || args.N >= slot.n_p {
+        px.log[args.Seq].n_p = args.N
+        px.log[args.Seq].n_a = args.N
+        px.log[args.Seq].v_a = args.V
         reply.OK = true
     } else {
         reply.OK = false
@@ -242,12 +255,31 @@ func (px *Paxos) Ph2AcceptRPCHandler (args *Ph2AcceptArgs, reply *Ph2AcceptReply
 // This method tells learners that this value has been decided for a particular seq.
 func (px *Paxos) Ph3DecidedRPCHandler (args *Ph3DecidedArgs, reply *Ph3DecidedReply) error {
     if args.Me != px.me {
+        //DPrintf("px me %d: PH3 RPC handler: spinning for lock pos 1.\n",px.me)
         px.mu.Lock()
+        //DPrintf("px me %d: PH3 RPC handler: lock acquired pos 1.\n",px.me)
+        px.peersDone[args.Me] = args.MeDone
         defer px.mu.Unlock()
     }
-
-    px.log[args.Seq].v = args.V
-    px.log[args.Seq].fate = Decided
+    _, exists := px.log[args.Seq]
+    
+    if ! exists{
+        DPrintf("px me %d: PH# px.log[%d] DOES NOT EXIST. currentMinSeq: %d, maxseq: %d\n",px.me, args.Seq, px.currentMinSeq, px.currentMaxSeq)
+        px.log[args.Seq] = &lSlot{
+            n_a: N_NIL,
+            n_p: N_NIL,
+            v: args.V,
+            fate: Decided,
+        }
+    } else {
+        if px.log[args.Seq].fate == Decided {
+            // ignore!
+            DPrintf("px me %d: PH3 px.log[%d] ALREADY EXISTS AND DECIDED ALR: orig v : %v, decihandler v: %v. Skipping..\n",px.me, args.Seq, px.log[args.Seq].v, args.V )
+            return nil
+        }
+        px.log[args.Seq].v = args.V
+        px.log[args.Seq].fate = Decided
+    }
     return nil
 }
 
@@ -255,7 +287,7 @@ func (px *Paxos) Ph3DecidedRPCHandler (args *Ph3DecidedArgs, reply *Ph3DecidedRe
 // utility function to get the majority from PH1 (prepare propose) replies
 // returns (true, value) if there is a majority, otherwise false.
 func (px *Paxos) getMajority(replies []Ph1AcceptReply, hasReplied []bool) (bool, interface{}) {
-    nMajority := int(math.Floor(float64(len(px.peers) / 2)))
+    nMajority := int(math.Ceil(float64(len(px.peers) / 2)))
     naCounts := make(map[ProposalNum]int)
     for _, reply := range replies {
         if reply.AlreadyAccepted {
@@ -297,12 +329,10 @@ func (px *Paxos) runLearner () {
         // TODO: refine granularity of this lock here.
         // (potential improvement)
         px.mu.Lock()
-        // loop through all tings
         for seq := px.currentMinSeq; seq <= px.currentMaxSeq; seq++ {
             slot, exists := px.log[seq]
             if exists && slot.fate == Pending {
                 // then ping acceptors for this seq instance
-                //TODO: get propNum
                 var N uint32 = 1
                 if px.log[seq].n_p != N_NIL {
                     N, _ = px.parseProposalNumber(px.log[seq].n_p)
@@ -311,12 +341,12 @@ func (px *Paxos) runLearner () {
                 //ProposalNum // highest proposed number
 
                 // TODO: what if it didnt get accepted? need to figure out looping here!
-                // it wont be accepted 
-                // TODO: simply use N_p of the ph1 reply to retry.
+                // it wont be accepted. simply use N_p of the ph1 reply to retry.
                 ph1Args := Ph1AcceptArgs{
                     Seq: seq,
                     N: propNum,
                     Me: px.me,
+                    MeDone: px.meDone,
                 }
                 var ph1Replies []Ph1AcceptReply = make([]Ph1AcceptReply, len(px.peers))
                 var hasReplied []bool = make([]bool, len(px.peers))
@@ -338,9 +368,13 @@ func (px *Paxos) runLearner () {
                         Seq: seq,
                         Me: px.me,
                         V: v,
+                        MeDone: px.meDone,
                     }
 
                     var ph3DecidedReply  Ph3DecidedReply
+
+                    DPrintf("px me %d: runLearner() got a majority for seq %d and calling own PH3 handler. args.V: %v\n",
+                        px.me, seq, ph3DecidedArgs.V )
                     px.Ph3DecidedRPCHandler(&ph3DecidedArgs, &ph3DecidedReply)
                 }
             }
@@ -359,7 +393,7 @@ func (px *Paxos) runLearner () {
 func (px *Paxos) getProposalNumber(n uint32) ProposalNum {
     I := px.meHash
     var propNum ProposalNum = ProposalNum(I)
-    propNum += ProposalNum(n) << 32
+    propNum |= ProposalNum(n) << 32
     return propNum
 }
 
@@ -388,14 +422,14 @@ func (px *Paxos) Start(seq int, v interface{}) {
     DPrintf("px me %d: started for seq %d\n",px.me, seq)
 	// Your code here.
     px.mu.Lock()
-    defer px.mu.Unlock()
     if seq < px.currentMinSeq {
+        px.mu.Unlock()
         return
     }
 
     cInst, exists := px.log[seq]
-    //TODO: confirm whether this 'Pending' check here won't break functionality.
     if exists && (cInst.fate == Decided || cInst.fate == Pending) {
+        px.mu.Unlock()
         return
     }
 
@@ -414,23 +448,34 @@ func (px *Paxos) Start(seq int, v interface{}) {
     // but this thread needs to live until something is decided for this seq (doesn't have to be our v).
     // it is the application's responsibility to keep on retrying for its operation to be done,
     // not paxos.
+    px.mu.Unlock()
     go func() {
         var currentN uint32 = 1
         var propNum ProposalNum = px.getProposalNumber(currentN)
-        nMajority := int(math.Floor(float64(len(px.peers) / 2)))
-        for px.log[seq].fate != Decided {
+        nMajority := int(math.Ceil(float64(len(px.peers)) / 2))
+        for {
+            px.mu.Lock()
+            if px.currentMinSeq > seq || px.log[seq].fate == Decided {
+                px.mu.Unlock()
+                break
+            }
+            px.mu.Unlock()
+
             // ------------------- PHASE 1 --------------------
             ph1Args := Ph1AcceptArgs{
                 Seq: seq,
                 N: propNum,
                 Me: px.me,
+                MeDone: px.meDone,
             }
             var ph1Replies []Ph1AcceptReply = make([]Ph1AcceptReply, len(px.peers))
             var hasReplied []bool = make([]bool, len(px.peers))
             for i, peer := range px.peers {
                 hasReplied[i] = true
                 if i == px.me {
+                    px.mu.Lock()
                     px.Ph1AcceptRPCHandler(&ph1Args, &ph1Replies[i])
+                    px.mu.Unlock()
                 } else {
                     ok := call(peer, "Paxos.Ph1AcceptRPCHandler", ph1Args, &ph1Replies[i])
                     if !ok {
@@ -438,6 +483,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
                     }
                 }
             }
+
             // count how many OKs
             nPromises := 0
             var maxNp ProposalNum = 0
@@ -450,7 +496,10 @@ func (px *Paxos) Start(seq int, v interface{}) {
                     }
                 }
             }
+            DPrintf("px me %d: proposer thread for seq %d: after phase 1 rpc calls. Obtained %d nPromises, %d maj needed, total: %d\n",
+            px.me, seq, nPromises,nMajority, len(px.peers))
             if nPromises < nMajority {
+                DPrintf("px me %d: proposer thread for seq %d: restarting since more votes needed.\n",px.me, seq)
                 nProp, _ := px.parseProposalNumber(maxNp)
                 currentN = nProp + 1
                 propNum = px.getProposalNumber(currentN)
@@ -467,14 +516,17 @@ func (px *Paxos) Start(seq int, v interface{}) {
             // first, figure out what V to use.
             var highestNa ProposalNum = N_NIL
             vUse := v
-            for _, reply := range ph1Replies {
+            for IDX, reply := range ph1Replies {
                 if !reply.OK {
                     continue
                 }
                 if reply.AlreadyAccepted {
-                    if highestNa == N_NIL || highestNa <reply.N_a {
+                    DPrintf("px me %d: proposer thread for seq %d: PH2 looking at already Accepted reply: %v\n", px.me, seq, &reply)
+                    if highestNa == N_NIL && reply.N_a != N_NIL || highestNa <reply.N_a {
                         highestNa = reply.N_a
                         vUse = reply.V_a
+                        DPrintf("px me %d: proposer thread for seq %d: PH2 got v %v highestNa: %d from me: %d\n",
+                        px.me, seq, vUse, highestNa,IDX )
                     }
                 }
             }
@@ -485,6 +537,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
                 N: propNum,
                 V: vUse,
                 Me: px.me,
+                MeDone: px.meDone,
             }
 
             var ph2Replies []Ph2AcceptReply = make([]Ph2AcceptReply, len(px.peers))
@@ -492,10 +545,15 @@ func (px *Paxos) Start(seq int, v interface{}) {
             // send PH2 accepts to everyone.
             nOKs := 0
             maxNp = 0
+            // why is v also v'
+
+            DPrintf("px me %d: proposer thread for seq %d, propnum %d: PH2 calling accept RPC for majority v': %v with highestNa: %d,  own v': %v\n",px.me, seq, propNum, vUse, highestNa, v)
             for i, peer := range px.peers{
                 ok := true
                 if i == px.me {
+                    px.mu.Lock()
                     px.Ph2AcceptRPCHandler(&ph2Args, &ph2Replies[i])
+                    px.mu.Unlock()
                 } else {
                     ok = call(peer, "Paxos.Ph2AcceptRPCHandler", ph2Args, &ph2Replies[i])
                 }
@@ -508,19 +566,23 @@ func (px *Paxos) Start(seq int, v interface{}) {
                 }
             }
 
-
-
             if nOKs >= nMajority  {
                 // ----------------------- PHASE 3 - send DECIDED RPC ------------------------------
-                ph3DecidedArgs := Ph3DecidedArgs{
+                DPrintf("px me %d: proposer thread for seq %d: entering phase 3..\n",px.me, seq)
+
+                ph3DecidedArgs := Ph3DecidedArgs {
                     Seq: seq,
                     Me: px.me,
                     V: vUse,
+                    MeDone: px.meDone,
                 }
                 ph3DecidedReplies := make([]Ph3DecidedReply, len(px.peers))
                 for i, peer := range px.peers{
+                    DPrintf("px me %d: proposer ting calling Ph3 handler of me %d for seq %d. vUse: %v\n",px.me, i, seq, vUse)
                     if i == px.me {
+                        px.mu.Lock()
                         px.Ph3DecidedRPCHandler(&ph3DecidedArgs, &ph3DecidedReplies[i])
+                        px.mu.Unlock()
                     } else {
                         call(peer, "Paxos.Ph3DecidedRPCHandler", ph3DecidedArgs, &ph3DecidedReplies[i])
                     }
@@ -533,12 +595,38 @@ func (px *Paxos) Start(seq int, v interface{}) {
                 // TODO: implement back off period based on order w.r.t. ID of proposer
                 // to whom acceptor committed.
                 // for now, we implement a fixed amount
+                //DPrintf("px me %d: proposer thread for seq %d: lock Released pos 2..\n",px.me, seq)
                 time.Sleep(livenessBackoffMillis  * time.Millisecond)
                 continue
             }
         }
     }()
     return
+}
+
+
+// utility function for cleanup of everything before smallest done.
+func (px *Paxos) cleanupDones() {
+    minDone := -1
+    for idx, _ := range px.peers {
+        d, exists := px.peersDone[idx]
+        if !exists {
+            // if one of them doesn't even have a done value, then we 
+            // need to wait for it
+            return
+        }
+        if minDone == -1 || d < minDone {
+            minDone = d
+        }
+    }
+    for i := px.currentMinSeq; i <= minDone; i++ {
+        delete(px.log, i)
+    }
+    if minDone + 1 > px.currentMinSeq {
+        // advance our currentMinSeq, since we've deleted all before it.
+        px.currentMinSeq = minDone + 1
+    }
+    //DPrintf("px me %d: after cleanupDones(). currentMinSeq: %d, peersDone: %v\n",px.me, px.currentMinSeq, px.peersDone)
 }
 
 //
@@ -549,28 +637,15 @@ func (px *Paxos) Start(seq int, v interface{}) {
 //
 func (px *Paxos) Done(seq int) {
 	// Your code here.
-    minDone := -1
-    for _, peer := range px.peers {
-        d, exists := px.peersDone[peer]
-        if !exists {
-            // if one of them doesn't even have a done value, then we 
-            // need to wait for it
-            return
-        }
-        if minDone == -1 || d < minDone {
-            minDone = d
-        }
+    px.mu.Lock()
+    defer px.mu.Unlock()
+    //DPrintf("px me %d: BEFORE Done(%d) meDone: %d, peersDone: %v\n",px.me, seq, px.meDone, px.peersDone)
+    if seq > px.meDone {
+        px.peersDone[px.me] = seq
+        px.meDone = seq
     }
-    // discard all instances at or below minDone
-    for i := px.currentMinSeq; i <= minDone; i++ {
-        delete(px.log, i)
-    }
-
-    px.currentMinSeq = minDone + 1
-
-    // old array implementation of log
-    //px.log = px.log[minDone + 1:]
-
+    px.cleanupDones()
+    //DPrintf("px me %d: Done(%d) meDone: %d, peersDone: %v\n",px.me, seq, px.meDone, px.peersDone)
 }
 
 //
@@ -618,9 +693,14 @@ func (px *Paxos) Max() int {
 func (px *Paxos) Min() int {
 	// You code here.
     px.mu.Lock()
-    v := px.currentMinSeq
+    min := -99
+    for _, d := range px.peersDone {
+        if min == -99 || d < min {
+            min = d
+        }
+    }
     px.mu.Unlock()
-    return v
+    return min + 1
 }
 
 
@@ -644,12 +724,9 @@ func (px *Paxos) Status(seq int) (Fate, interface{}) {
     }
     logSlot , exists  := px.log[seq]
     if !exists {
-        //TODO: im still not sure about this. what happens if:
-        // P1 issues Start() 
-        // P2 DIRECTLY calls Status() before P1 RPC calls P2's Acceptor
-        // What should P2 return? pending?
+        // Should return pending here as this is a 'future' request. 
+        // (Piazza @219_f2)
         return Pending, nil
-
     }
     return logSlot.fate, logSlot.v
 }
@@ -697,8 +774,10 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 	px := &Paxos{}
 	px.peers = peers
 	px.me = me
-    px.peersDone = make(map[string]int)
+    px.meDone = -1
+    px.peersDone = make(map[int]int)
     px.currentMinSeq = 0
+    px.currentMaxSeq = -1
     px.log = make(map[int]*lSlot)
     h := fnv.New32a()
     h.Write([]byte(peers[me]))
