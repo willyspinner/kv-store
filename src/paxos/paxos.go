@@ -46,7 +46,6 @@ const (
 	Decided   Fate = iota + 1
 	Pending        // not yet decided.
 	Forgotten      // decided but forgotten.
-    Uninitialized // when it has been created in log, but not decided nor pending.
 )
 
 
@@ -58,7 +57,7 @@ const (
 // app constants. This can be changed
 const (
     livenessBackoffMillis = 75
-    learnerPingMillis = 150 // every learnerPingMillis milliseconds, discover any newly-decided values (useful for when
+    learnerPingMillis = 350 // every learnerPingMillis milliseconds, discover any newly-decided values (useful for when
     // proposer doesn't send decided RPC (e.g. it crashes)
 )
 
@@ -129,6 +128,7 @@ func (px *Paxos) Ph1AcceptRPCHandler (args *Ph1AcceptArgs, reply *Ph1AcceptReply
     DPrintf("px me %d: ph1 accept rpc handler for seq %d. begin\n",px.me, args.Seq)
     if args.Me != px.me {
         px.mu.Lock()
+        DPrintf("px me %d: ph1 accept rpc handler for seq %d. acquired lock\n",px.me, args.Seq)
         px.peersDone[args.Me] = args.MeDone
         px.cleanupDones()
         defer px.mu.Unlock()
@@ -201,6 +201,7 @@ func (px *Paxos) Ph3DecidedRPCHandler (args *Ph3DecidedArgs, reply *Ph3DecidedRe
         px.mu.Lock()
         //DPrintf("px me %d: PH3 RPC handler: lock acquired pos 1.\n",px.me)
         px.peersDone[args.Me] = args.MeDone
+        px.cleanupDones() // we can clean up here to see if lowest MeDone is higher than before
         defer px.mu.Unlock()
     }
     _, exists := px.log[args.Seq]
@@ -258,33 +259,84 @@ func (px *Paxos) getMajority(replies []Ph1AcceptReply, hasReplied []bool) (bool,
     return true, v
 
 }
+
+// utility function
+func (px* Paxos) printSlot( seq int, exists bool, slot *lSlot) {
+    status := "(incorrect status)"
+    if slot == nil || !exists {
+        DPrintf("px me %d: printSlot(): seq %d slot NIL / doesn't exist\n",
+        px.me, seq)
+        return
+    } else if slot.fate == Pending {
+        status = "PENDING"
+    } else if slot.fate == Decided {
+        status = "DECIDED"
+    } else if slot.fate == Forgotten {
+        status = "FORGOTTEN"
+    }
+    DPrintf("px me %d: printSlot(): seq %d slot is %s, my isDone: %v, contents: v: %v, v_a: %v, n_a: %v, n_p: %v, highestNpTry: %d\n",
+    px.me, seq, status, px.meDone, slot.v,slot.v_a,slot.n_a,slot.n_p, slot.highestNpTry)
+    return
+}
+
 // ------------------- Learner function ---------------------
 
+
+func max (a,b ProposalNum) ProposalNum {
+    if a <= b {
+        return b
+    }
+    return a
+}
+func maxInt(a,b int) int {
+    if a <= b {
+        return b
+    }
+    return a
+}
 // long-running function where the paxos peer acts as a learner
 // and discovers functions.
 // this should be run in a separate goroutine
 
+
 func (px *Paxos) runLearner () {
     for {
         // TODO: refine granularity of this lock here.
-        // (potential improvement)
-        px.mu.Lock()
-        for seq := px.currentMinSeq; seq <= px.currentMaxSeq; seq++ {
-            DPrintf("px me %d: runLearner() is scanning from px.currentMinSeq %d to px.currentMaxSeq %d (inclusive) \n",
-            px.me, px.currentMinSeq, px.currentMaxSeq)
+        // be careful OF DEADLOCKS
+        // p1 is in runLearner and wants to inquire on p2
+        // AT THE SAME TIME
+        // p2 is in runLearner and wants to inquire on p1
+        // deadlock.
+        //idea: maybe release this lock?
 
+        px.mu.Lock()
+        DPrintf("px me %d: runLearner() is scanning from %d to px.currentMaxSeq %d (inclusive) (Note: px.currentMinSeq: %d)\n",
+            px.me, maxInt(px.meDone + 1, px.currentMinSeq), px.currentMaxSeq, px.currentMinSeq)
+
+        for seq := maxInt(px.meDone + 1, px.currentMinSeq); seq <= px.currentMaxSeq; seq++ {
             slot, exists := px.log[seq]
-            if exists && slot.fate == Pending {
+            px.printSlot(seq, exists, slot)
+            //if !exists || slot.fate == Pending {
+            // if it is pending, then our Start() guy is taking care of it.
+            if ! exists || slot.fate == Pending {
+                // somehow this is problematic. Why?
+                if !exists {
+                    //create one
+                    px.log[seq] = &lSlot{
+                        n_a: N_NIL,
+                        n_p: N_NIL,
+                        fate: Pending,
+                        highestNpTry: 0,
+                    }
+                }
+                DPrintf("px me %d: runLearner() is pursuing slot seq %d \n",px.me, seq)
                 // then ping acceptors for this seq instance
                 var N uint32 = 1
-                if px.log[seq].n_p != N_NIL {
-                    N, _ = px.parseProposalNumber(px.log[seq].n_p)
+                if px.log[seq].n_p != N_NIL || px.log[seq].highestNpTry > 0 {
+                    N, _ = px.parseProposalNumber(max(px.log[seq].n_p, px.log[seq].highestNpTry))
                 }
                 propNum := px.getProposalNumber(N + 1)
-                //ProposalNum // highest proposed number
 
-                // TODO: what if it didnt get accepted? need to figure out looping here!
-                // it wont be accepted. simply use N_p of the ph1 reply to retry.
                 ph1Args := Ph1AcceptArgs{
                     Seq: seq,
                     N: propNum,
@@ -293,17 +345,25 @@ func (px *Paxos) runLearner () {
                 }
                 var ph1Replies []Ph1AcceptReply = make([]Ph1AcceptReply, len(px.peers))
                 var hasReplied []bool = make([]bool, len(px.peers))
+                var highestN_p ProposalNum= 0
                 for i, peer := range px.peers {
+                    DPrintf("px me %d: runLearner() calling RPC Ph1AcceptRPCHandler to me %d\n",px.me, i)
                     if i == px.me {
                         px.Ph1AcceptRPCHandler(&ph1Args, &ph1Replies[i])
                         hasReplied[i] = true
                     } else {
+                        px.mu.Unlock()
                         ok := call(peer, "Paxos.Ph1AcceptRPCHandler", ph1Args, &ph1Replies[i])
+                        px.mu.Lock()
                         if ok {
                             hasReplied[i] = true
+                            if highestN_p < ph1Replies[i].N_p {
+                                highestN_p = ph1Replies[i].N_p
+                            }
                         }
                     }
                 }
+                px.log[seq].highestNpTry = max(highestN_p, px.log[seq].highestNpTry)
                 hasMajority, v := px.getMajority(ph1Replies, hasReplied)
                 if hasMajority {
                     // if a majority is found, then call Ph3DecidedRPCHandler
@@ -569,7 +629,6 @@ func (px *Paxos) cleanupDones() {
         // advance our currentMinSeq, since we've deleted all before it.
         px.currentMinSeq = minDone + 1
     }
-    //DPrintf("px me %d: after cleanupDones(). currentMinSeq: %d, peersDone: %v\n",px.me, px.currentMinSeq, px.peersDone)
 }
 
 //
@@ -582,13 +641,11 @@ func (px *Paxos) Done(seq int) {
 	// Your code here.
     px.mu.Lock()
     defer px.mu.Unlock()
-    //DPrintf("px me %d: BEFORE Done(%d) meDone: %d, peersDone: %v\n",px.me, seq, px.meDone, px.peersDone)
     if seq > px.meDone {
         px.peersDone[px.me] = seq
         px.meDone = seq
     }
     px.cleanupDones()
-    //DPrintf("px me %d: Done(%d) meDone: %d, peersDone: %v\n",px.me, seq, px.meDone, px.peersDone)
 }
 
 //
@@ -666,6 +723,7 @@ func (px *Paxos) Status(seq int) (Fate, interface{}) {
     }
     logSlot , exists  := px.log[seq]
     if !exists {
+        DPrintf("px me %d: status for seq %d, NIL, log: %v\n",px.me, seq, px.log)
         // Should return pending here as this is a 'future' request. 
         // (Piazza @219_f2)
         return Pending, nil
@@ -729,6 +787,7 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 
 
 	// Your initialization code here.
+    go px.runLearner()
 
 	if rpcs != nil {
 		// caller will create socket &c

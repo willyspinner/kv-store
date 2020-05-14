@@ -21,6 +21,7 @@ type lSlot struct {
     n_p         ProposalNum // highest proposed number
     fate        Fate
     meCommitted int // ID of proposer to whom acceptor has committed
+    highestNpTry ProposalNum // this is for the learner to keep track of which N it should try next.
 }
 
 type Ph1AcceptArgs struct {
