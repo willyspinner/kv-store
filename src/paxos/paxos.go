@@ -288,8 +288,9 @@ func max (a,b ProposalNum) ProposalNum {
     }
     return a
 }
-func maxInt(a,b int) int {
-    if a <= b {
+
+func minInt(a,b int) int {
+    if a > b {
         return b
     }
     return a
@@ -301,25 +302,14 @@ func maxInt(a,b int) int {
 
 func (px *Paxos) runLearner () {
     for {
-        // TODO: refine granularity of this lock here.
-        // be careful OF DEADLOCKS
-        // p1 is in runLearner and wants to inquire on p2
-        // AT THE SAME TIME
-        // p2 is in runLearner and wants to inquire on p1
-        // deadlock.
-        //idea: maybe release this lock?
-
         px.mu.Lock()
         DPrintf("px me %d: runLearner() is scanning from %d to px.currentMaxSeq %d (inclusive) (Note: px.currentMinSeq: %d)\n",
-            px.me, maxInt(px.meDone + 1, px.currentMinSeq), px.currentMaxSeq, px.currentMinSeq)
+            px.me, minInt(px.meDone + 1, px.currentMinSeq), px.currentMaxSeq, px.currentMinSeq)
 
-        for seq := maxInt(px.meDone + 1, px.currentMinSeq); seq <= px.currentMaxSeq; seq++ {
+        for seq := minInt(px.meDone + 1, px.currentMinSeq); seq <= px.currentMaxSeq; seq++ {
             slot, exists := px.log[seq]
             px.printSlot(seq, exists, slot)
-            //if !exists || slot.fate == Pending {
-            // if it is pending, then our Start() guy is taking care of it.
             if ! exists || slot.fate == Pending {
-                // somehow this is problematic. Why?
                 if !exists {
                     //create one
                     px.log[seq] = &lSlot{
@@ -362,6 +352,12 @@ func (px *Paxos) runLearner () {
                             }
                         }
                     }
+                }
+                _, exists := px.log[seq]
+                // check
+                if ! exists {
+                    px.mu.Unlock()
+                    return
                 }
                 px.log[seq].highestNpTry = max(highestN_p, px.log[seq].highestNpTry)
                 hasMajority, v := px.getMajority(ph1Replies, hasReplied)
@@ -611,6 +607,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
 // utility function for cleanup of everything before smallest done.
 func (px *Paxos) cleanupDones() {
     minDone := -1
+    DPrintf("px.me: %d cleanupDones:  peersDone: %d, currentMinSeq: %d\n", px.me, px.peersDone, px.currentMinSeq)
     for idx, _ := range px.peers {
         d, exists := px.peersDone[idx]
         if !exists {
@@ -693,9 +690,9 @@ func (px *Paxos) Max() int {
 func (px *Paxos) Min() int {
 	// You code here.
     px.mu.Lock()
-    min := -99
+    min := px.peersDone[0]
     for _, d := range px.peersDone {
-        if min == -99 || d < min {
+        if d < min {
             min = d
         }
     }
@@ -775,8 +772,14 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 	px := &Paxos{}
 	px.peers = peers
 	px.me = me
+
+
+	// Your initialization code here.
     px.meDone = -1
     px.peersDone = make(map[int]int)
+    for i, _ := range peers {
+        px.peersDone[i] = -1
+    }
     px.currentMinSeq = 0
     px.currentMaxSeq = -1
     px.log = make(map[int]*lSlot)
@@ -784,9 +787,6 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
     h.Write([]byte(peers[me]))
     px.meHash = h.Sum32()
     px.nMajority = (len(px.peers) / 2) + 1 // account for both odd and even
-
-
-	// Your initialization code here.
     go px.runLearner()
 
 	if rpcs != nil {
