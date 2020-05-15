@@ -3,12 +3,14 @@ package kvpaxos
 import "net/rpc"
 import "crypto/rand"
 import "math/big"
-
+import "time"
 import "fmt"
 
 type Clerk struct {
 	servers []string
 	// You will have to modify this struct.
+	prev_id	int64			// last server ID
+
 }
 
 func nrand() int64 {
@@ -22,6 +24,7 @@ func MakeClerk(servers []string) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.prev_id = -1
 	return ck
 }
 
@@ -66,7 +69,23 @@ func call(srv string, rpcname string,
 //
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
-	return ""
+	var reply GetReply
+	set_id := nrand()
+	// set curr server ID to previous ID
+	args := GetArgs{Key:key, Curr_ID:set_id, Prev_ID:ck.prev_id}
+
+	// keep trying to fetch until we get an answer
+	ok := false
+	for !ok{
+		for _, server := range ck.servers{
+			ok = call(server, "KVPaxos.Get", &args, &reply)
+			if !ok{
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}
+	ck.prev_id = set_id
+	return reply.Value
 }
 
 //
@@ -74,6 +93,20 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	var reply PutAppendReply
+	set_id := nrand()
+	args := PutAppendArgs{Key:key, Value:value, Op:op, Curr_ID:set_id, Prev_ID:ck.prev_id}
+
+	ok := false
+	for !ok{
+		for _, server := range ck.servers{
+			ok = call(server, "KVPaxos.PutAppend", &args, &reply)
+			if !ok{
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}
+	ck.prev_id = set_id
 }
 
 func (ck *Clerk) Put(key string, value string) {

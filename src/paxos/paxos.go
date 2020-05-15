@@ -77,7 +77,7 @@ type Paxos struct {
     log        map[int]*lSlot // maps sequence number to the corresponding lslot object
     currentMinSeq int // minimum sequence number that hasn't been forgotten
     currentMaxSeq int // max sequence number this paxos peer knows so far.
-    peersDone  map[int] int // maps a peers entry to its done level 
+    peersDone  map[int] int // maps a peers entry to its done level
     meHash     uint32
     meDone     int // our latest Done() value.
 
@@ -161,7 +161,7 @@ func (px *Paxos) Ph1AcceptRPCHandler (args *Ph1AcceptArgs, reply *Ph1AcceptReply
             reply.N_a = slot.n_a
         }
     } else {
-        // reject proposal. 
+        // reject proposal.
         reply.OK = false
         reply.MeCommitted = slot.meCommitted
         reply.N_p = slot.n_p
@@ -471,7 +471,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
     go func() {
         var currentN uint32 = 1
         var propNum ProposalNum = px.getProposalNumber(currentN)
-            
+
         for {
             px.mu.Lock()
             if px.currentMinSeq > seq || px.log[seq].fate == Decided {
@@ -654,7 +654,7 @@ func (px *Paxos) cleanupDones() {
     for idx, _ := range px.peers {
         d, exists := px.peersDone[idx]
         if !exists {
-            // if one of them doesn't even have a done value, then we 
+            // if one of them doesn't even have a done value, then we
             // need to wait for it
             return
         }
@@ -761,15 +761,22 @@ func (px *Paxos) Status(seq int) (Fate, interface{}) {
     if seq < px.currentMinSeq {
         return Forgotten, nil
     }
-    logSlot , exists  := px.log[seq]
-    if !exists {
-        DPrintf("px me %d: status for seq %d, NIL, log: %v\n",px.me, seq, px.log)
-        // Should return pending here as this is a 'future' request. 
-        // (Piazza @219_f2)
-        return Pending, nil
-    }
-    DPrintf("px me %d: status for seq %d, Decided: %v, log: %v\n",px.me, seq, logSlot.fate == Decided,px.log)
-    return logSlot.fate, logSlot.v
+    logSlot, exists  := px.log[seq]
+		if exists && logSlot.fate == Decided{
+			DPrintf("px me %d: status for seq %d, Decided: %v, log: %v\n",px.me, seq, logSlot.fate == Decided,px.log)
+			return logSlot.fate, logSlot.v
+		} else{
+			return Pending, nil
+		}
+    // if !exists && logSlot.fate != Decided{
+    //     DPrintf("px me %d: status for seq %d, NIL, log: %v\n",px.me, seq, px.log)
+    //     // Should return pending here as this is a 'future' request.
+    //     // (Piazza @219_f2)
+    //     return Pending, nil
+    // }
+    // DPrintf("px me %d: status for seq %d, Decided: %v, log: %v\n",px.me, seq, logSlot.fate == Decided,px.log)
+    // return logSlot.fate, logSlot.v
+
 }
 
 
