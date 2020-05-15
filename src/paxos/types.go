@@ -39,6 +39,7 @@ type Ph1AcceptReply struct {
     N_a             ProposalNum
     MeCommitted     int // Id of proposer to whom acceptor has committed. This is to aid liveness back off
     N_p             ProposalNum // if proposal fails, proposer uses this to change its propnum.
+    SeqMax          int
 }
 
 
@@ -53,6 +54,7 @@ type Ph2AcceptArgs struct {
 type Ph2AcceptReply struct {
     OK          bool
     N_p         ProposalNum // if proposal fails, proposer uses this to change propnum
+    SeqMax      int
 }
 
 type Ph3DecidedArgs struct {
@@ -64,4 +66,5 @@ type Ph3DecidedArgs struct {
 
 type Ph3DecidedReply struct {
     OK          bool
+    SeqMax      int
 }

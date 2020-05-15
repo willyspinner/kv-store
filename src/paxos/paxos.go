@@ -130,6 +130,9 @@ func (px *Paxos) Ph1AcceptRPCHandler (args *Ph1AcceptArgs, reply *Ph1AcceptReply
         px.mu.Lock()
         DPrintf("px me %d: ph1 accept rpc handler for seq %d. acquired lock\n",px.me, args.Seq)
         px.peersDone[args.Me] = args.MeDone
+        if args.MeDone > px.currentMaxSeq {
+            px.currentMaxSeq = args.MeDone
+        }
         px.cleanupDones()
         defer px.mu.Unlock()
     }
@@ -163,6 +166,7 @@ func (px *Paxos) Ph1AcceptRPCHandler (args *Ph1AcceptArgs, reply *Ph1AcceptReply
         reply.MeCommitted = slot.meCommitted
         reply.N_p = slot.n_p
     }
+    reply.SeqMax = px.currentMaxSeq
     return nil
 }
 
@@ -170,6 +174,9 @@ func (px *Paxos) Ph2AcceptRPCHandler (args *Ph2AcceptArgs, reply *Ph2AcceptReply
     if args.Me != px.me {
         px.mu.Lock()
         px.peersDone[args.Me] = args.MeDone
+        if args.MeDone > px.currentMaxSeq {
+            px.currentMaxSeq = args.MeDone
+        }
         defer px.mu.Unlock()
     }
     slot, exists := px.log[args.Seq]
@@ -190,6 +197,7 @@ func (px *Paxos) Ph2AcceptRPCHandler (args *Ph2AcceptArgs, reply *Ph2AcceptReply
         reply.OK = false
         reply.N_p = slot.n_p
     }
+    reply.SeqMax = px.currentMaxSeq
     return nil
 }
 
@@ -201,6 +209,9 @@ func (px *Paxos) Ph3DecidedRPCHandler (args *Ph3DecidedArgs, reply *Ph3DecidedRe
         px.mu.Lock()
         //DPrintf("px me %d: PH3 RPC handler: lock acquired pos 1.\n",px.me)
         px.peersDone[args.Me] = args.MeDone
+        if args.MeDone > px.currentMaxSeq {
+            px.currentMaxSeq = args.MeDone
+        }
         px.cleanupDones() // we can clean up here to see if lowest MeDone is higher than before
         defer px.mu.Unlock()
     }
@@ -222,6 +233,7 @@ func (px *Paxos) Ph3DecidedRPCHandler (args *Ph3DecidedArgs, reply *Ph3DecidedRe
         px.log[args.Seq].v = args.V
         px.log[args.Seq].fate = Decided
     }
+    reply.SeqMax = px.currentMaxSeq
     return nil
 }
 
@@ -274,8 +286,8 @@ func (px* Paxos) printSlot( seq int, exists bool, slot *lSlot) {
     } else if slot.fate == Forgotten {
         status = "FORGOTTEN"
     }
-    DPrintf("px me %d: printSlot(): seq %d slot is %s, my isDone: %v, contents: v: %v, v_a: %v, n_a: %v, n_p: %v, highestNpTry: %d\n",
-    px.me, seq, status, px.meDone, slot.v,slot.v_a,slot.n_a,slot.n_p, slot.highestNpTry)
+    DPrintf("px me %d: printSlot(): seq %d slot is %s, my isDone: %v, contents: v: %v, v_a: %v, n_a: %v, n_p: %v, highestNpTry: %d, peersDone: %v\n",
+    px.me, seq, status, px.meDone, slot.v,slot.v_a,slot.n_a,slot.n_p, slot.highestNpTry, px.peersDone)
     return
 }
 
@@ -306,7 +318,8 @@ func (px *Paxos) runLearner () {
         DPrintf("px me %d: runLearner() is scanning from %d to px.currentMaxSeq %d (inclusive) (Note: px.currentMinSeq: %d)\n",
             px.me, minInt(px.meDone + 1, px.currentMinSeq), px.currentMaxSeq, px.currentMinSeq)
 
-        for seq := minInt(px.meDone + 1, px.currentMinSeq); seq <= px.currentMaxSeq; seq++ {
+        currentMaxSeq := px.currentMaxSeq
+        for seq := minInt(px.meDone + 1, px.currentMinSeq); seq <= currentMaxSeq; seq++ {
             slot, exists := px.log[seq]
             px.printSlot(seq, exists, slot)
             if ! exists || slot.fate == Pending {
@@ -350,6 +363,9 @@ func (px *Paxos) runLearner () {
                             if highestN_p < ph1Replies[i].N_p {
                                 highestN_p = ph1Replies[i].N_p
                             }
+                            if ph1Replies[i].SeqMax > px.currentMaxSeq {
+                                px.currentMaxSeq = ph1Replies[i].SeqMax
+                            }
                         }
                     }
                 }
@@ -375,8 +391,12 @@ func (px *Paxos) runLearner () {
                     DPrintf("px me %d: runLearner() got a majority for seq %d and calling own PH3 handler. args.V: %v\n",
                         px.me, seq, ph3DecidedArgs.V )
                     px.Ph3DecidedRPCHandler(&ph3DecidedArgs, &ph3DecidedReply)
+
                 }
             }
+            //px.mu.Unlock()
+            currentMaxSeq = px.currentMaxSeq
+            //px.mu.Lock()
         }
         px.mu.Unlock()
         time.Sleep(learnerPingMillis * time.Millisecond)
@@ -427,7 +447,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
     }
 
     cInst, exists := px.log[seq]
-    if exists && (cInst.fate == Decided || cInst.fate == Pending) {
+    if exists && (cInst.fate == Decided || (cInst.fate == Pending && cInst.v != nil)) {
         px.mu.Unlock()
         return
     }
@@ -458,6 +478,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
                 px.mu.Unlock()
                 break
             }
+            meDone := px.meDone
             px.mu.Unlock()
 
             // ------------------- PHASE 1 --------------------
@@ -465,7 +486,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
                 Seq: seq,
                 N: propNum,
                 Me: px.me,
-                MeDone: px.meDone,
+                MeDone: meDone,
             }
             var ph1Replies []Ph1AcceptReply = make([]Ph1AcceptReply, len(px.peers))
             var hasReplied []bool = make([]bool, len(px.peers))
@@ -479,6 +500,12 @@ func (px *Paxos) Start(seq int, v interface{}) {
                     ok := call(peer, "Paxos.Ph1AcceptRPCHandler", ph1Args, &ph1Replies[i])
                     if !ok {
                         hasReplied[i] = false
+                    } else {
+                        px.mu.Lock()
+                        if ph1Replies[i].SeqMax > px.currentMaxSeq {
+                            px.currentMaxSeq = ph1Replies[i].SeqMax
+                        }
+                        px.mu.Unlock()
                     }
                 }
             }
@@ -498,7 +525,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
             DPrintf("px me %d: proposer thread for seq %d: after phase 1 rpc calls. Obtained %d nPromises, %d maj needed, total: %d\n",
             px.me, seq, nPromises,px.nMajority, len(px.peers))
             if nPromises < px.nMajority {
-                DPrintf("px me %d: proposer thread for seq %d: restarting since more votes needed.\n",px.me, seq)
+                DPrintf("px me %d: proposer thread for seq %d, v: %v: restarting since more votes needed.\n",px.me, seq, v)
                 nProp, _ := px.parseProposalNumber(maxNp)
                 currentN = nProp + 1
                 propNum = px.getProposalNumber(currentN)
@@ -530,6 +557,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
                 }
             }
 
+            px.mu.Lock()
             // then, send the accepts.
             ph2Args := Ph2AcceptArgs{
                 Seq: seq,
@@ -538,6 +566,7 @@ func (px *Paxos) Start(seq int, v interface{}) {
                 Me: px.me,
                 MeDone: px.meDone,
             }
+            px.mu.Unlock()
 
             var ph2Replies []Ph2AcceptReply = make([]Ph2AcceptReply, len(px.peers))
 
@@ -562,6 +591,11 @@ func (px *Paxos) Start(seq int, v interface{}) {
                     } else if maxNp < ph2Replies[i].N_p {
                         maxNp = ph2Replies[i].N_p
                     }
+                    px.mu.Lock()
+                    if ph2Replies[i].SeqMax > px.currentMaxSeq {
+                        px.currentMaxSeq = ph2Replies[i].SeqMax
+                    }
+                    px.mu.Unlock()
                 }
             }
 
@@ -569,12 +603,14 @@ func (px *Paxos) Start(seq int, v interface{}) {
                 // ----------------------- PHASE 3 - send DECIDED RPC ------------------------------
                 DPrintf("px me %d: proposer thread for seq %d: entering phase 3..\n",px.me, seq)
 
+                px.mu.Lock()
                 ph3DecidedArgs := Ph3DecidedArgs {
                     Seq: seq,
                     Me: px.me,
                     V: vUse,
                     MeDone: px.meDone,
                 }
+                px.mu.Unlock()
                 ph3DecidedReplies := make([]Ph3DecidedReply, len(px.peers))
                 for i, peer := range px.peers{
                     DPrintf("px me %d: proposer ting calling Ph3 handler of me %d for seq %d. vUse: %v\n",px.me, i, seq, vUse)
@@ -583,7 +619,15 @@ func (px *Paxos) Start(seq int, v interface{}) {
                         px.Ph3DecidedRPCHandler(&ph3DecidedArgs, &ph3DecidedReplies[i])
                         px.mu.Unlock()
                     } else {
-                        call(peer, "Paxos.Ph3DecidedRPCHandler", ph3DecidedArgs, &ph3DecidedReplies[i])
+                        ok := call(peer, "Paxos.Ph3DecidedRPCHandler", ph3DecidedArgs, &ph3DecidedReplies[i])
+                        if ok {
+                            px.mu.Lock()
+                            if ph3DecidedReplies[i].SeqMax > px.currentMaxSeq {
+                                px.currentMaxSeq = ph3DecidedReplies[i].SeqMax
+                            }
+                            px.mu.Unlock()
+
+                        }
                     }
                 }
             } else {
@@ -607,7 +651,6 @@ func (px *Paxos) Start(seq int, v interface{}) {
 // utility function for cleanup of everything before smallest done.
 func (px *Paxos) cleanupDones() {
     minDone := -1
-    DPrintf("px.me: %d cleanupDones:  peersDone: %d, currentMinSeq: %d\n", px.me, px.peersDone, px.currentMinSeq)
     for idx, _ := range px.peers {
         d, exists := px.peersDone[idx]
         if !exists {
