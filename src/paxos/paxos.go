@@ -105,7 +105,7 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 	if err != nil {
 		err1 := err.(*net.OpError)
 		if err1.Err != syscall.ENOENT && err1.Err != syscall.ECONNREFUSED {
-			fmt.Printf("paxos Dial() failed: %v\n", err1)
+			//fmt.Printf("paxos Dial() failed: %v\n", err1)
 		}
 		return false
 	}
@@ -350,7 +350,7 @@ func (px *Paxos) runLearner () {
                 var hasReplied []bool = make([]bool, len(px.peers))
                 var highestN_p ProposalNum= 0
                 for i, peer := range px.peers {
-                    DPrintf("px me %d: runLearner() calling RPC Ph1AcceptRPCHandler to me %d\n",px.me, i)
+                    DPrintf("px me %d: runLearner() calling RPC Ph1AcceptRPCHandler to me %d on seq %d\n",px.me, i, seq)
                     if i == px.me {
                         px.Ph1AcceptRPCHandler(&ph1Args, &ph1Replies[i])
                         hasReplied[i] = true
@@ -358,6 +358,7 @@ func (px *Paxos) runLearner () {
                         px.mu.Unlock()
                         ok := call(peer, "Paxos.Ph1AcceptRPCHandler", ph1Args, &ph1Replies[i])
                         px.mu.Lock()
+                        DPrintf("px me %d: runLearner() Ph1RPC results for me %d for seq %d: RPC ok: %v, reply.OK: %v, reply.AlreadyAccepted: %v, v_a: %v\n", px.me, i, seq, ok, ph1Replies[i].OK, ph1Replies[i].AlreadyAccepted,ph1Replies[i].V_a)
                         if ok {
                             hasReplied[i] = true
                             if highestN_p < ph1Replies[i].N_p {
@@ -377,6 +378,7 @@ func (px *Paxos) runLearner () {
                 }
                 px.log[seq].highestNpTry = max(highestN_p, px.log[seq].highestNpTry)
                 hasMajority, v := px.getMajority(ph1Replies, hasReplied)
+                DPrintf("px me %d: runLearner() ph1 results: majority: %v on seq %d\n",px.me, hasMajority, seq)
                 if hasMajority {
                     // if a majority is found, then call Ph3DecidedRPCHandler
                     ph3DecidedArgs := Ph3DecidedArgs{
@@ -650,19 +652,15 @@ func (px *Paxos) Start(seq int, v interface{}) {
 
 // utility function for cleanup of everything before smallest done.
 func (px *Paxos) cleanupDones() {
-    minDone := -1
+    minDone := px.peersDone[0]
     for idx, _ := range px.peers {
-        d, exists := px.peersDone[idx]
-        if !exists {
-            // if one of them doesn't even have a done value, then we
-            // need to wait for it
-            return
-        }
-        if minDone == -1 || d < minDone {
+        d, _ := px.peersDone[idx] // always exists since we initialized it at the start.
+        if d < minDone {
             minDone = d
         }
     }
     for i := px.currentMinSeq; i <= minDone; i++ {
+        DPrintf("px me %d: deleting seq %d from px.log, currentMinSeq: %d, minDone: %d, peersDone: %v\n",px.me, i, px.currentMinSeq, minDone, px.peersDone)
         delete(px.log, i)
     }
     if minDone + 1 > px.currentMinSeq {
@@ -739,6 +737,7 @@ func (px *Paxos) Min() int {
             min = d
         }
     }
+    DPrintf("px me %d: peersDone %v, returning min %d + 1\n", px.me, px.peersDone, min)
     px.mu.Unlock()
     return min + 1
 }

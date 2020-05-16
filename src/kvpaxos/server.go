@@ -45,7 +45,8 @@ type KVPaxos struct {
 	// Your definitions here.
 	keyVal			map[string]string			// key value pairs
 	requests		map[int64]string
-	seqCount		int
+    seqToID         map[int]int64 // maps sequence number to ID (used to delete requests)
+    seqCount        int
 }
 
 // Run paxos -- modified from code given in assignment spec
@@ -71,7 +72,7 @@ func Update(kv *KVPaxos, op Op){
 	if command == "Get"{
 		log.Printf("KVPaxos: Updating: GET")
 		if ok{
-			kv.requests[op.Curr_ID] = res
+			kv.requests[op.Curr_ID] = op.Key
 		} else{
 			kv.requests[op.Curr_ID] = ErrNoKey
 		}
@@ -95,8 +96,8 @@ func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 	kv.mu.Lock()
 
 	// check for duplicate Get req
-	prevId, ok := kv.requests[args.Curr_ID]
-	if ok && prevId == args.Key{
+	key, ok := kv.requests[args.Curr_ID]
+	if ok && key == args.Key {
 		reply.Value = kv.keyVal[args.Key]
 		reply.Err = OK
 		kv.mu.Unlock()
@@ -141,14 +142,14 @@ func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 
 		// update results from the Get call
 		if res.Curr_ID == args.Curr_ID{
-			req := kv.requests[args.Curr_ID]
-			if req != ErrNoKey{
-				reply.Value = kv.requests[args.Curr_ID]
-				reply.Err = OK
-			} else{		// send no key error
-				reply.Value = ""
-				reply.Err = ErrNoKey
-			}
+            val, exists := kv.keyVal[set_op.Key]
+            if exists {
+                reply.Value = val
+                reply.Err = OK
+            } else {
+                reply.Value = ""
+                reply.Err = ErrNoKey
+            }
 			break
 		}
 	}
@@ -205,7 +206,6 @@ func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 
 		// finished -> call Paxos done
 		kv.px.Done(seq_num)
-		log.Printf("KVPaxos: PUTAPPEND: Called Done from Paxos")
 
 		if res.Curr_ID == args.Curr_ID{
 			break
