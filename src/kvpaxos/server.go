@@ -66,23 +66,27 @@ func Paxos(kv *KVPaxos, seq int, op Op) Op{
 }
 
 func Update(kv *KVPaxos, op Op){
-	log.Printf("KVPaxos: Updating...")
+	DPrintf("KVPaxos: Updating...")
 	res, ok := kv.keyVal[op.Key]
 	command := op.Operation
+	_, exists := kv.requests[op.Curr_ID]
+	if exists && (command == "Put" || command == "Append" ) {
+        return
+    }
 	if command == "Get"{
-		log.Printf("KVPaxos: Updating: GET")
+		DPrintf("KVPaxos: Updating: GET")
 		if ok{
 			kv.requests[op.Curr_ID] = op.Key
 		} else{
 			kv.requests[op.Curr_ID] = ErrNoKey
 		}
 	} else if command == "Put"{
-		log.Printf("KVPaxos: Updating: PUT")
+		DPrintf("KVPaxos: Updating: PUT")
 		// put -- set the result to keyVal
 		kv.keyVal[op.Key] = op.Value
 		kv.requests[op.Curr_ID] = OK
 	} else if command == "Append"{
-		log.Printf("KVPaxos: Updating: APPEND")
+		DPrintf("KVPaxos: Updating: APPEND")
 		// append -- add the result to existing value
 		kv.keyVal[op.Key] = res + op.Value
 		kv.requests[op.Curr_ID] = OK
@@ -91,7 +95,7 @@ func Update(kv *KVPaxos, op Op){
 
 
 func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
-	log.Printf("KVPaxos: GET")
+	DPrintf("KVPaxos: GET")
 	// Your code here.
 	kv.mu.Lock()
 
@@ -117,12 +121,12 @@ func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 		status, val := kv.px.Status(seq_num)
 
 		// check if decided, if not then run Paxos again
-		log.Printf("KVPaxos: Checking STATUS")
+		DPrintf("KVPaxos: Checking STATUS")
 		if status == paxos.Decided{
 			res = val.(Op)
 		} else{
 			res = Paxos(kv, seq_num, set_op)
-			log.Printf("KVPaxos: GET: Done Running Paxos")
+			DPrintf("KVPaxos: GET: Done Running Paxos")
 		}
 
 		// clean client requests that are done
@@ -134,11 +138,11 @@ func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 		}
 		// update keyVal/ requests based on Op -> call Update function
 		Update(kv, res)
-		log.Printf("KVPaxos: Updating in GET")
+		DPrintf("KVPaxos: Updating in GET")
 
 		// finish processing -> call Done from Paxos
 		kv.px.Done(seq_num)
-		log.Printf("KVPaxos: Called Done from Paxos")
+		DPrintf("KVPaxos: Called Done from Paxos")
 
 		// update results from the Get call
 		if res.Curr_ID == args.Curr_ID{
@@ -154,13 +158,13 @@ func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 		}
 	}
 	kv.mu.Unlock()
-	log.Printf("KVPaxos: GET Done")
+	DPrintf("KVPaxos: GET Done")
 	return nil
 }
 
 func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	// Your code here.
-	log.Printf("KVPaxos: PUTAPPEND")
+	DPrintf("KVPaxos: PUTAPPEND")
 	kv.mu.Lock()
 
 	// check for duplicates
@@ -181,7 +185,7 @@ func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 		kv.seqCount += 1
 
 		// check status of the Paxos
-		log.Printf("KVPaxos: PUTAPPEND getting STATUS")
+		DPrintf("KVPaxos: PUTAPPEND getting STATUS")
 		status, val := kv.px.Status(seq_num)
 
 		// check if decided, if not then run Paxos again
@@ -189,7 +193,7 @@ func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 			res = val.(Op)
 		} else{
 			res = Paxos(kv, seq_num, set_op)
-			log.Printf("KVPaxos: PUTAPPEND: Done Running Paxos")
+			DPrintf("KVPaxos: PUTAPPEND: Done Running Paxos")
 		}
 
 		// clean client requests that are done
@@ -202,7 +206,7 @@ func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 
 		// update keyVal/requests based on Op
 		Update(kv, res)
-		log.Printf("KVPaxos: Done Updating PUTAPPEND")
+		DPrintf("KVPaxos: Done Updating PUTAPPEND")
 
 		// finished -> call Paxos done
 		kv.px.Done(seq_num)
