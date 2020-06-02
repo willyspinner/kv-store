@@ -24,6 +24,7 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+    ID   int64
 
 }
 
@@ -34,6 +35,7 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+    ID int64
 }
 
 type GetReply struct {
@@ -41,3 +43,13 @@ type GetReply struct {
 	Value string
 }
 
+
+// these are used to get key values of shards in join, move, leave, etc.
+type RetrieveKVArgs struct {
+    NewConfigNum int
+}
+
+type RetrieveKVReply struct {
+    KeyVal map[string] string
+    Requests map[int64] bool
+}
