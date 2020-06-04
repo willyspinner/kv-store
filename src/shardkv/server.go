@@ -18,14 +18,6 @@ import "path"
 
 const Debug = 0
 
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf(format, a...)
-	}
-	return
-}
-
 func (kv *ShardKV) DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
         a := append([]interface{}{path.Base(kv.myAddr), kv.gid, kv.me, kv.config.Num}, a...)
@@ -92,7 +84,7 @@ func (kv *ShardKV) Paxos(seq int, op Op) Op{
 }
 
 
-/* Log our entire KeyVal and request for our current config number */
+/* Log our entire KV and request for our current config number */
 func (kv *ShardKV) logKVHistory() {
     kvHistory := make(map[string]string)
     for k,v := range kv.keyVal {
@@ -104,6 +96,7 @@ func (kv *ShardKV) logKVHistory() {
     for reqID, _ := range kv.requests {
         requestsHistory[reqID] = true
     }
+    
     cfgNum := kv.config.Num
     kv.keyValHistory[cfgNum] = kvHistory
     kv.requestsHistory[cfgNum] = requestsHistory
@@ -133,12 +126,8 @@ func (kv* ShardKV) updateState(op Op) {
         }
 		kv.requests[op.ID] = true
 	} else if command == "Reconfiguration" {
-        if op.Config.Num < kv.config.Num {
-            kv.DPrintf("CONFIGURING to an older cfg num: %d -> %d\n", kv.config.Num, op.Config.Num)
-            log.Fatalf("ERROR\n")
-        }
         kv.DPrintf("updateState() reconfiguration logging num %d \n", kv.config.Num)
-        // Save a snapshot first. This will be used for RetrieveKV requests.
+        // we save a snapshot first. This will be used for RetrieveKV requests.
         kv.logKVHistory()
 
         // then update keyVal, requests and config.
@@ -214,13 +203,7 @@ func (kv *ShardKV) RetrieveKV(args *RetrieveKVArgs, reply *RetrieveKVReply) erro
         kv.mu.Lock()
     }
 
-    oldKV, exists := kv.keyValHistory[args.NewConfigNum - 1]
-    if ! exists {
-        kv.DPrintf("ERROR: history %d doesn't exist.\n", args.NewConfigNum - 1)
-        log.Fatalf("ERROR: history %d doesn't exist.\n", args.NewConfigNum - 1)
-    }
-
-    reply.KeyVal = oldKV
+    reply.KeyVal = kv.keyValHistory[args.NewConfigNum - 1]
     reply.Requests = kv.requestsHistory[args.NewConfigNum - 1]
     return nil
 }
@@ -418,11 +401,10 @@ func (kv *ShardKV) tick() {
         nextCfgNum := kv.config.Num + 1
         nextConfig := kv.sm.Query(nextCfgNum)
         updateKeyVal, updateRequests := kv.getKVFromReconfig(&kv.config, &nextConfig)
-        kv.DPrintf("tick() - reconfiguring. %d -> %d, nextConfig: %d\n", kv.config.Num, upToDateConfig.Num, nextConfig.Num)
         if nextCfgNum <= kv.config.Num {
-            kv.DPrintf("tick(): continuing..\n")
             continue
         }
+        kv.DPrintf("tick() - reconfiguring. %d -> %d, nextConfig: %d\n", kv.config.Num, upToDateConfig.Num, nextConfig.Num)
 
         set_op := Op {
             Operation:"Reconfiguration",
