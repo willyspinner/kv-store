@@ -2,7 +2,7 @@
 
 ###         VARIABLES TO SET          ###
 
-if [ "$N_CORES}" == "" ]; then
+if [ "${N_CORES}" == "" ]; then
     export N_CORES=8
 fi
 if [ "${N_TRIALS}" == "" ]; then 

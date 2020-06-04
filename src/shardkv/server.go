@@ -16,7 +16,8 @@ import "shardmaster"
 import "path"
 
 
-const Debug = 1
+const Debug = 0
+
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -35,11 +36,15 @@ func (kv *ShardKV) DPrintf(format string, a ...interface{}) (n int, err error) {
 
 type Op struct {
 	// Your definitions here.
-    Operation  string // "Put", "Append", "Get", "Reconfiguration"
+    Operation  string // "Put", "Append", "Get", "Reconfiguration", or "Noop"
     Key        string
     Value      string
     ID         int64
-    Config     shardmaster.Config // for reconfiguration
+
+    // for reconfiguration:
+    Config     shardmaster.Config
+    KeyVal map[string] string
+    Requests map[int64] bool
 }
 
 
@@ -58,9 +63,15 @@ type ShardKV struct {
     requests map[int64] bool // to check if a request ID has been served before.
     keyVal map[string] string
 
-    config shardmaster.Config // current sharding configuration
+    // paxos / networking
     myAddr string
     paxosSeqCount int
+
+    // for dealing with configuration changes
+    config shardmaster.Config 
+    // keeps snapshots of keyval and requests for each config number.
+    keyValHistory map[int] map[string]string
+    requestsHistory map[int] map[int64] bool
 }
 
 
@@ -80,6 +91,24 @@ func (kv *ShardKV) Paxos(seq int, op Op) Op{
 	}
 }
 
+
+/* Log our entire KeyVal and request for our current config number */
+func (kv *ShardKV) logKVHistory() {
+    kvHistory := make(map[string]string)
+    for k,v := range kv.keyVal {
+        if kv.isHandlingKey(k, &kv.config) {
+            kvHistory[k] = v
+        }
+    }
+    requestsHistory := make(map[int64] bool)
+    for reqID, _ := range kv.requests {
+        requestsHistory[reqID] = true
+    }
+    cfgNum := kv.config.Num
+    kv.keyValHistory[cfgNum] = kvHistory
+    kv.requestsHistory[cfgNum] = requestsHistory
+}
+
 // update KV state based on operation Op, or no-op if already exists.
 // does not assume anything about whether we're responsible
 // for the shard or not.
@@ -93,11 +122,9 @@ func (kv* ShardKV) updateState(op Op) {
 	if command == "Get"{
         kv.requests[op.ID] = true
 	} else if command == "Put"{
-		// put -- set the result to keyVal
 		kv.keyVal[op.Key] = op.Value
 		kv.requests[op.ID] = true
 	} else if command == "Append"{
-		// append -- add the result to existing value
         res, keyExists := kv.keyVal[op.Key]
         if keyExists {
             kv.keyVal[op.Key] = res + op.Value
@@ -105,127 +132,162 @@ func (kv* ShardKV) updateState(op Op) {
             kv.keyVal[op.Key] = op.Value
         }
 		kv.requests[op.ID] = true
-	}
+	} else if command == "Reconfiguration" {
+        if op.Config.Num < kv.config.Num {
+            kv.DPrintf("CONFIGURING to an older cfg num: %d -> %d\n", kv.config.Num, op.Config.Num)
+            log.Fatalf("ERROR\n")
+        }
+        kv.DPrintf("updateState() reconfiguration logging num %d \n", kv.config.Num)
+        // Save a snapshot first. This will be used for RetrieveKV requests.
+        kv.logKVHistory()
+
+        // then update keyVal, requests and config.
+        for k, v := range op.KeyVal {
+            kv.keyVal[k] = v
+        }
+        for id, _ := range op.Requests {
+            kv.requests[id] = true
+        }
+        kv.config = op.Config
+    }
 }
 
 func isHandlingKey(key string, config *shardmaster.Config, fromGid int64) bool {
     shard := key2shard(key)
+    if shard >= len(config.Shards) {
+        return false
+    }
     shardGid := config.Shards[shard]
-    //NOTE: when shardGid is 0, then we are initializing
-    return shardGid == 0 || shardGid == fromGid
+    // NOTEDIFF: changed the below
+    return (shardGid != 0) && shardGid == fromGid
 }
+
+
 
 func (kv *ShardKV) isHandlingKey(key string, config *shardmaster.Config) bool {
     return isHandlingKey(key, config, kv.gid)
 }
 
-func (kv *ShardKV) RetrieveKV(args *RetrieveKVArgs, reply *RetrieveKVReply) error {
-    //TODO: Make sure to avoid deadlock when two groups get assigned each others shards.
-    //TODO: this is wrong. Need to wait until our config number is the same or above?
-    kv.DPrintf("RetrieveKV(): called with cfg num %v \n", args.NewConfigNum)
-    kv.mu.Lock()
-    kv.DPrintf("RetrieveKV(): unlocked..\n")
-    defer kv.mu.Unlock()
-    /*
-    reply.KeyVal = kv.keyVal
-    reply.Requests = kv.requests
-    return nil
-    */
 
+
+func (kv *ShardKV) RetrieveKV(args *RetrieveKVArgs, reply *RetrieveKVReply) error {
+    kv.mu.Lock()
+    kv.DPrintf("RetrieveKV(): called with cfg num %v unlocked \n", args.NewConfigNum)
+    defer kv.mu.Unlock()
+
+    set_op := Op{Operation:"Noop", ID: nrand()}
     for kv.config.Num < args.NewConfigNum {
 		var res Op
 		seq_num := kv.paxosSeqCount
-		// get status of current Paxos
+
 		status, val := kv.px.Status(seq_num)
 
-		// check if decided, if not then run Paxos again
 		if status == paxos.Decided {
 			res = val.(Op)
-            if res.Operation == "Reconfiguration" {
-                kv.handleReconfiguration(res)
-            } else {
-                if kv.isHandlingKey(res.Key, &kv.config) {
-                    kv.updateState(res)
-                }
-            }
-
-            // finish processing -> call Done from Paxos
-            kv.px.Done(seq_num)
-            kv.paxosSeqCount += 1
+        } else {
+			res = kv.Paxos(seq_num, set_op)
         }
+
+        if res.Operation == "Reconfiguration" {
+            kv.updateState(res)
+        } else {
+            if kv.isHandlingKey(res.Key, &kv.config) {
+                kv.updateState(res)
+            }
+        }
+        kv.DPrintf("RetriveKV() got res %v\n", res)
+
+        // finish processing -> call Done from Paxos
+        kv.px.Done(seq_num)
+        kv.paxosSeqCount += 1
+
+        if res.ID == set_op.ID {
+            if kv.config.Num >= args.NewConfigNum {
+                break
+            } else {
+                set_op =  Op{Operation:"Noop", ID: nrand()}
+            }
+        }
+        // unlock so tick() can run if there's any config changes.
+        kv.mu.Unlock()
+        time.Sleep(50 * time.Millisecond)
+        kv.mu.Lock()
     }
 
-    reply.KeyVal = kv.keyVal
-    reply.Requests = kv.requests
+    oldKV, exists := kv.keyValHistory[args.NewConfigNum - 1]
+    if ! exists {
+        kv.DPrintf("ERROR: history %d doesn't exist.\n", args.NewConfigNum - 1)
+        log.Fatalf("ERROR: history %d doesn't exist.\n", args.NewConfigNum - 1)
+    }
+
+    reply.KeyVal = oldKV
+    reply.Requests = kv.requestsHistory[args.NewConfigNum - 1]
     return nil
 }
 
-func (kv *ShardKV) importKV(reply *RetrieveKVReply, fromGid int64) {
-    newKeyVal := reply.KeyVal
-    newRequests := reply.Requests
-    for k, v := range newKeyVal {
-        if !isHandlingKey(k, &kv.config, fromGid) {
-            kv.DPrintf("importKV(): key \"%s\", v %s of newKeyVal skipped since old gid was not handling it before. ", k, v)
-            continue
-        }
 
-        if oldVal, exists:= kv.keyVal[k];  exists {
-            kv.DPrintf("importKV(): key \"%s\" of newKeyVal already exists (%v), but replacing with %s", k, oldVal, v)
-        } else {
-            kv.DPrintf("importKV(): importing new key \"%s\", value %s", k, v)
-        }
-        kv.keyVal[k] = v
-    }
-    for id, _ := range newRequests {
-        kv.requests[id] = true
-    }
-}
+// handles a new reconfiguration based on op. Assumes that we are inside a mutex Lock()
+func (kv *ShardKV) getKVFromReconfig(previousConfig *shardmaster.Config, newConfig *shardmaster.Config) (map[string]string, map[int64] bool){
+    newKeyVal := make(map[string] string)
+    newRequests := make(map[int64] bool)
 
-func (kv *ShardKV) handleReconfiguration(op Op) {
-    newConfig := op.Config
     // if we have no config before, then no need to retrieve from other shards.
-    if kv.config.Num == 0 {
-        kv.config = newConfig
-        return
+    if previousConfig.Num == 0 {
+        return newKeyVal, newRequests
     }
 
     // check for new shards we have to deal with.
     for newShard, newGid := range newConfig.Shards {
         // get the group that was previously responsible for this.
-        previousGid := kv.config.Shards[newShard]
-        previousServers := kv.config.Groups[previousGid]
+        previousGid := previousConfig.Shards[newShard]
+        previousServers := previousConfig.Groups[previousGid]
         if newGid == kv.gid && kv.gid != previousGid {
-            args := RetrieveKVArgs{NewConfigNum: newConfig.Num}
-            reply := RetrieveKVReply{}
             hasRetrieved := false
             for !hasRetrieved {
-                // retrieve from the old people.
                 for i, server := range previousServers {
-                    kv.DPrintf("handleReconfiguration(): retrieving from server GID %d me %d, address %v..\n", previousGid, i, path.Base(server))
-                    ok := call(server, "ShardKV.RetrieveKV", args, &reply)
-                    if ok {
-                        hasRetrieved = true
-                        kv.importKV(&reply, previousGid)
+                    kv.DPrintf("getKVFromReconfig(): retrieving %d -> %d from server GID %d me %d, address %v..\n", 
+                                    previousConfig.Num, newConfig.Num, previousGid, i, path.Base(server))
+
+                    args := RetrieveKVArgs{NewConfigNum: newConfig.Num}
+                    reply := RetrieveKVReply{}
+                    kv.mu.Unlock()
+
+                    hasRetrieved = call(server, "ShardKV.RetrieveKV", args, &reply)
+
+                    kv.mu.Lock()
+                    if hasRetrieved {
+                        for k, v := range reply.KeyVal{
+                            if isHandlingKey(k, previousConfig, previousGid) {
+                                newKeyVal[k] = v
+                            } else {
+                                kv.DPrintf("getKVFromReconfig(): key \"%s\", v %s of newKeyVal skipped since old gid was not handling it before. ", k, v)
+                                continue
+                            }
+                        }
+                        for id, _ := range reply.Requests {
+                            newRequests[id] = true
+                        }
                         break
                     }
                 }
             }
         }
     }
-    kv.config = newConfig
+    return newKeyVal, newRequests
 }
+
+
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 	// Your code here.
 
-    kv.DPrintf("GET: key: %v, id: %v\n", args.Key, args.ID)
     kv.mu.Lock()
-    kv.DPrintf("GET: got past Lock() \n")
+    kv.DPrintf("GET %v, id: %v got past lock\n", args.Key, args.ID)
     defer kv.mu.Unlock()
 
     // first, check if we are responsible for this key.
     if ! kv.isHandlingKey(args.Key, &kv.config) {
-        kv.DPrintf("GET: not responsible for key %v\n", args.Key)
+        kv.DPrintf("GET not responsible for key %v\n", args.Key)
         reply.Err = ErrWrongGroup
         return nil
     }
@@ -248,7 +310,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 		}
 
         if res.Operation == "Reconfiguration" {
-            kv.handleReconfiguration(res)
+            kv.updateState(res)
         } else {
             if kv.isHandlingKey(res.Key, &kv.config) {
                 kv.updateState(res)
@@ -262,16 +324,17 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 		if res.ID == args.ID {
             if ! kv.isHandlingKey(args.Key, &kv.config) {
                 reply.Err = ErrWrongGroup
-            }
-            val, exists := kv.keyVal[set_op.Key]
-            if exists {
-                reply.Value = val
-                reply.Err = OK
-                kv.DPrintf("GET: key: %v id: %v, replying  value %v \n", args.Key, args.ID, val)
             } else {
-                reply.Value = ""
-                reply.Err = ErrNoKey
-                kv.DPrintf("GET: key: %v id: %v, replying ErrNoKey \n", args.Key, args.ID)
+                val, exists := kv.keyVal[set_op.Key]
+                if exists {
+                    reply.Value = val
+                    reply.Err = OK
+                    kv.DPrintf("GET %v id: %v, replying  value %v \n", args.Key, args.ID, val)
+                } else {
+                    reply.Value = ""
+                    reply.Err = ErrNoKey
+                    kv.DPrintf("GET %v id: %v, replying ErrNoKey \n", args.Key, args.ID)
+                }
             }
 			break
 		}
@@ -283,9 +346,8 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 // RPC handler for client Put and Append requests
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	// Your code here.
-    kv.DPrintf("PutAppend() %v %v %v, id: %d\n", args.Op, args.Key, args.Value, args.ID)
     kv.mu.Lock()
-    kv.DPrintf("PutAppend(): got past Lock() \n")
+    kv.DPrintf("PutAppend() %v %v %v, id: %d past lock\n", args.Op, args.Key, args.Value, args.ID)
     defer kv.mu.Unlock()
 
     // first, check if we are responsible for this key.
@@ -320,7 +382,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 		}
 
         if res.Operation == "Reconfiguration" {
-            kv.handleReconfiguration(res)
+            kv.updateState(res)
         } else {
             if kv.isHandlingKey(res.Key, &kv.config) {
                 kv.updateState(res)
@@ -349,19 +411,30 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 // if so, re-configure.
 //
 func (kv *ShardKV) tick() {
-    // TODO: have a feeling that we need to keep watch of the paxos log here.
     kv.mu.Lock()
     defer kv.mu.Unlock()
     upToDateConfig := kv.sm.Query(-1)
-    if upToDateConfig.Num > kv.config.Num {
-        kv.DPrintf("tick() - reconfiguring. %d -> %d", kv.config.Num, upToDateConfig.Num)
-        ID := nrand()
+    for kv.config.Num < upToDateConfig.Num {
+        nextCfgNum := kv.config.Num + 1
+        nextConfig := kv.sm.Query(nextCfgNum)
+        updateKeyVal, updateRequests := kv.getKVFromReconfig(&kv.config, &nextConfig)
+        kv.DPrintf("tick() - reconfiguring. %d -> %d, nextConfig: %d\n", kv.config.Num, upToDateConfig.Num, nextConfig.Num)
+        if nextCfgNum <= kv.config.Num {
+            kv.DPrintf("tick(): continuing..\n")
+            continue
+        }
+
+        set_op := Op {
+            Operation:"Reconfiguration",
+            ID:nrand(),
+            Config: nextConfig,
+            KeyVal: updateKeyVal,
+            Requests:updateRequests,
+        }
         for {
             var res Op
             seq_num := kv.paxosSeqCount
-            set_op := Op{Operation:"Reconfiguration", ID:ID, Config: upToDateConfig}
 
-            // add seq count by 1
             kv.paxosSeqCount += 1
 
             // get status of current Paxos
@@ -369,17 +442,14 @@ func (kv *ShardKV) tick() {
 
             // check if decided, if not then run Paxos again
             if status == paxos.Decided {
-                kv.DPrintf("tick() - reconfiguration:. decided on %v\n", val.(Op))
+                kv.DPrintf("tick() -  decided on %v\n", val.(Op))
                 res = val.(Op)
             } else {
                 res = kv.Paxos(seq_num, set_op)
             }
 
-            isReconfigured := false
-            if res.Operation == "Reconfiguration" && res.Config.Num >= upToDateConfig.Num {
-                kv.DPrintf("tick() - handlingReconfiguration for new config %d... \n", res.Config.Num)
-                kv.handleReconfiguration(res)
-                isReconfigured = true
+            if res.Operation == "Reconfiguration" {
+                kv.updateState(res)
             } else {
                 if kv.isHandlingKey(res.Key, &kv.config) {
                     kv.updateState(res)
@@ -388,11 +458,12 @@ func (kv *ShardKV) tick() {
 
             // finish processing -> call Done from Paxos
             kv.px.Done(seq_num)
-            if isReconfigured {
+            // break if our config is up to date, either by us or others.
+            if set_op.ID == res.ID || kv.config.Num == nextConfig.Num {
                 break
             }
         }
-
+        //nextCfgNum += 1
     }
 }
 
@@ -441,8 +512,6 @@ func StartServer(gid int64, shardmasters []string,
 	kv.sm = shardmaster.MakeClerk(shardmasters)
 
 	// Your initialization code here.
-	// Don't call Join().
-
 	rpcs := rpc.NewServer()
 	rpcs.Register(kv)
 
@@ -450,6 +519,8 @@ func StartServer(gid int64, shardmasters []string,
 
     kv.requests = make(map[int64] bool)
     kv.keyVal = make(map[string] string)
+    kv.keyValHistory = make(map[int] map[string]string)
+    kv.requestsHistory = make(map[int] map[int64]bool)
 
     kv.config = shardmaster.Config{Num: 0}
 
